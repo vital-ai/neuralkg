@@ -2,3 +2,7 @@
 .idea
 dist
 *.egg-info
+build
+__pycache__
+trained_model
+

@@ -1,0 +1,89 @@
+
+
+edge_id(e1).
+edge_source(e1, a).
+edge_target(e1, b).
+edge_weight(e1, 50).
+
+edge_id(e2).
+edge_source(e2, b).
+edge_target(e2, c).
+edge_weight(e2, 150).
+
+edge_id(e3).
+edge_source(e3, c).
+edge_target(e3, d).
+edge_weight(e3, 250).
+
+edge_id(e4).
+edge_source(e4, d).
+edge_target(e4, e).
+edge_weight(e4, 100).
+
+emp_id(e_alice).
+emp_name(e_alice, alice).
+emp_age(e_alice, 45).
+emp_salary(e_alice, 90000).
+
+emp_id(e_bob).
+emp_name(e_bob, bob).
+emp_age(e_bob, 38).
+emp_salary(e_bob, 85000).
+
+emp_id(e_carol).
+emp_name(e_carol, carol).
+emp_age(e_carol, 50).
+emp_salary(e_carol, 75000).
+
+emp_id(e_dave).
+emp_name(e_dave, dave).
+emp_age(e_dave, 42).
+emp_salary(e_dave, 82000).
+
+emp_id(e_eve).
+emp_name(e_eve, eve).
+emp_age(e_eve, 30).
+emp_salary(e_eve, 95000).
+
+edge3(X, Y, W) :-
+    edge_id(E),
+    edge_source(E, X),
+    edge_target(E, Y),
+    edge_weight(E, W).
+
+employee3(Name, Age, Salary) :-
+    emp_id(Emp),
+    emp_name(Emp, Name),
+    emp_age(Emp, Age),
+    emp_salary(Emp, Salary).
+
+light_edge(X, Y) :-
+    edge_id(E),
+    edge_source(E, X),
+    edge_target(E, Y),
+    edge_weight(E, W),
+    W < 200.
+
+light_edge3(X, Y, W) :-
+    edge3(X, Y, W),
+    W < 200.
+
+path(X, Y) :-
+    light_edge(X, Y).
+
+path(X, Z) :-
+    light_edge(X, Y),
+    path(Y, Z).
+
+eligible(Name) :-
+    emp_id(Emp),
+    emp_name(Emp, Name),
+    emp_age(Emp, Age),
+    Age > 40,
+    emp_salary(Emp, Salary),
+    Salary >= 80000.
+
+eligible3(Name, Age, Salary) :-
+    employee3(Name, Age, Salary),
+    Age > 40,
+    Salary >= 80000.
