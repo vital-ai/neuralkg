@@ -50,6 +50,14 @@ class Frame(ABC):
     @abstractmethod
     def concat(self, others: Iterable['Frame']) -> 'Frame':
         ...
+        
+    @abstractmethod
+    def concat_rows(self, other: 'Frame') -> 'Frame':
+        """Concatenate rows from another frame to this frame.
+        
+        This is a convenience method for concat([other]).
+        """
+        ...
 
     @abstractmethod
     def drop(self, columns: list[str]) -> 'Frame':
@@ -77,6 +85,19 @@ class PandasFrame(Frame):
     """
     __slots__ = ("_df",)
 
+    def __getitem__(self, key):
+        import pandas as pd
+        # Column selection
+        if isinstance(key, list):
+            return PandasFrame(self._df[key])
+        elif isinstance(key, str):
+            return self._df[key]
+        # Boolean row mask
+        elif isinstance(key, pd.Series) and key.dtype == bool:
+            return PandasFrame(self._df[key])
+        else:
+            raise TypeError(f"Invalid key type for PandasFrame: {type(key)}")
+
     def __init__(self, df: pd.DataFrame) -> None:
         self._df = df
 
@@ -87,7 +108,7 @@ class PandasFrame(Frame):
 
     @classmethod
     def from_dicts(cls, rows: list[dict[str, Any]], columns: list[str]) -> 'PandasFrame':
-        if not rows:
+        if rows is None or len(rows) == 0:
             return cls.empty(columns)
         df = pd.DataFrame(rows, columns=columns)
         for col in columns:
@@ -100,8 +121,45 @@ class PandasFrame(Frame):
     def rename(self, columns_map: dict[str, str]) -> 'PandasFrame':
         return PandasFrame(self._df.rename(columns=columns_map))
 
+    def filter(self, column: str, op: str, value: Any) -> 'PandasFrame':
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.debug(f"[PandasFrame.filter] Filtering: column={column}, op={op}, value={value}")
+        logger.debug(f"[PandasFrame.filter] Column dtype: {self._df[column].dtype}")
+        logger.debug(f"[PandasFrame.filter] Sample values: {self._df[column].head(10).tolist()}")
+        # Attempt type coercion if needed
+        series = self._df[column]
+        try:
+            if op in ("<", "<=", ">", ">="):
+                series = pd.to_numeric(series, errors='coerce')
+                value = float(value)
+        except Exception as e:
+            logger.warning(f"[PandasFrame.filter] Type coercion failed: {e}")
+        if op == '==':
+            mask = series == value
+        elif op in ('!=', '<>'):
+            mask = series != value
+        elif op == '<':
+            mask = series < value
+        elif op == '<=':
+            mask = series <= value
+        elif op == '>':
+            mask = series > value
+        elif op == '>=':
+            mask = series >= value
+        else:
+            raise ValueError(f"Unsupported operator: {op}")
+        logger.debug(f"[PandasFrame.filter] Filter mask: {mask.head(10).tolist()}")
+        filtered = self._df[mask].reset_index(drop=True)
+        logger.debug(f"[PandasFrame.filter] Filtered DataFrame shape: {filtered.shape}")
+        return PandasFrame(filtered)
+
     def filter_equals(self, column: str, value: Any) -> 'PandasFrame':
-        return PandasFrame(self._df[self._df[column] == value].reset_index(drop=True))
+        if callable(value):
+            mask = self._df[column].apply(value)
+            return PandasFrame(self._df[mask].reset_index(drop=True))
+        else:
+            return self.filter(column, '==', value)
 
     def assign(self, **kwargs: Any) -> 'PandasFrame':
         return PandasFrame(self._df.assign(**kwargs))
@@ -115,7 +173,16 @@ class PandasFrame(Frame):
         suffixes: tuple[str, str] = ("", ""),
         **kwargs
     ) -> 'PandasFrame':
-        assert isinstance(other, PandasFrame)
+        # Accept any Frame, convert to PandasFrame if needed
+        if not isinstance(other, PandasFrame):
+            other = PandasFrame.from_dicts(other.to_records(), other.columns())
+        # Upcast merge columns to object dtype in both DataFrames
+        for col in left_on:
+            if col in self._df.columns:
+                self._df[col] = self._df[col].astype(object)
+        for col in right_on:
+            if col in other._df.columns:
+                other._df[col] = other._df[col].astype(object)
         merged = self._df.merge(
             other._df,
             how=how,
@@ -130,6 +197,17 @@ class PandasFrame(Frame):
         frames = [self._df] + [o._df for o in others if isinstance(o, PandasFrame)]
         concatenated = pd.concat(frames, ignore_index=True)
         return PandasFrame(concatenated)
+        
+    def concat_rows(self, other: 'Frame') -> 'PandasFrame':
+        """Concatenate rows from another frame to this frame.
+        
+        This is a convenience method for concat([other]).
+        """
+        if not isinstance(other, PandasFrame):
+            # Convert other frame to PandasFrame if needed
+            other = PandasFrame.from_dicts(other.to_records(), other.columns())
+        
+        return self.concat([other])
 
     def drop(self, columns: list[str]) -> 'PandasFrame':
         return PandasFrame(self._df.drop(columns=columns))
@@ -145,9 +223,26 @@ class PandasFrame(Frame):
         return self._df.to_dict(orient="records")
 
     def columns(self) -> list[str]:
-        return list(self._df.columns)
+        import pandas as pd
+        assert isinstance(self._df, pd.DataFrame), f"PandasFrame._df must be a pd.DataFrame, got {type(self._df)}"
+        cols = self._df.columns
+        if not isinstance(cols, list):
+            cols = list(cols)
+        assert all(isinstance(c, str) for c in cols), f"PandasFrame.columns() must return list of str, got: {cols}"
+        return cols
 
     def num_rows(self) -> int:
+        return len(self._df)
+
+    def duplicated(self, *args, **kwargs):
+        # Returns a boolean Series indicating duplicate rows
+        return self._df.duplicated(*args, **kwargs)
+
+    def to_dict(self, *args, **kwargs):
+        # Delegate to the underlying DataFrame
+        return self._df.to_dict(*args, **kwargs)
+
+    def __len__(self):
         return len(self._df)
 
 # By default, we use PandasFrame. To switch, assign PolarsFrame here (once implemented).

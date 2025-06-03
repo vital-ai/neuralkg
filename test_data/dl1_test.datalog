@@ -15,10 +15,44 @@ edge_source(e3, c).
 edge_target(e3, d).
 edge_weight(e3, 250).
 
+// Example of negation
+no_back_edge(X, Y) :- edge(X, Y), not edge(Y, X).
+
+// Patch: define edge/2 for use in rules
+edge(X, Y) :- edge_id(E), edge_source(E, X), edge_target(E, Y).
+
 edge_id(e4).
 edge_source(e4, d).
 edge_target(e4, e).
 edge_weight(e4, 100).
+
+// Additional test edges for recursive path testing
+edge_id(e5).
+edge_source(e5, e).
+edge_target(e5, f).
+edge_weight(e5, 120).
+
+edge_id(e6).
+edge_source(e6, f).
+edge_target(e6, g).
+edge_weight(e6, 80).
+
+edge_id(e7).
+edge_source(e7, g).
+edge_target(e7, h).
+edge_weight(e7, 90).
+
+// Add a light cycle
+edge_id(e8).
+edge_source(e8, h).
+edge_target(e8, a).
+edge_weight(e8, 60).
+
+// Add a heavy edge to break some chains
+edge_id(e9).
+edge_source(e9, c).
+edge_target(e9, f).
+edge_weight(e9, 300).
 
 emp_id(e_alice).
 emp_name(e_alice, alice).
@@ -44,6 +78,22 @@ emp_id(e_eve).
 emp_name(e_eve, eve).
 emp_age(e_eve, 30).
 emp_salary(e_eve, 95000).
+
+// Extra employees for negation and comparison query results
+emp_id(e_frank).
+emp_name(e_frank, frank).
+emp_age(e_frank, 39).
+emp_salary(e_frank, 87000). // Not eligible (age < 40), salary > 80000
+
+emp_id(e_gina).
+emp_name(e_gina, gina).
+emp_age(e_gina, 41).
+emp_salary(e_gina, 75000). // Not eligible (salary < 80000), age > 40
+
+emp_id(e_hank).
+emp_name(e_hank, hank).
+emp_age(e_hank, 37).
+emp_salary(e_hank, 83000). // Not eligible (age < 40), salary > 80000
 
 edge3(X, Y, W) :-
     edge_id(E),
@@ -87,3 +137,15 @@ eligible3(Name, Age, Salary) :-
     employee3(Name, Age, Salary),
     Age > 40,
     Salary >= 80000.
+
+// Explicit rule for not eligible employees
+not_eligible(Name) :-
+    emp_name(Emp, Name), not eligible(Name).
+
+// Not eligible employees with Salary > 80000 (should match frank, hank)
+not_eligible_high_salary(Name, Salary) :-
+    emp_name(Emp, Name), emp_salary(Emp, Salary), not eligible(Name), Salary > 80000.
+
+// Not eligible employees with Age > 40 (should match gina)
+not_eligible_over_40(Name, Age) :-
+    emp_name(Emp, Name), emp_age(Emp, Age), not eligible(Name), Age > 40.

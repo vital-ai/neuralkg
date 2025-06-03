@@ -207,6 +207,43 @@ def main():
     goal_str_john = Literal("string_orders", (Constant("john"), StrVal))
     print("Query: string_orders(\"john\", X) →", db.query(goal_str_john).to_records())
 
+    # ---- Additional test: agg_sum and agg_count as body predicates ----
+    print("\n---- agg_* predicate body tests ----\n")
+    # Add a rule using agg_sum in the body: total_spent2(SUM) :- purchase(_, _, Amt), agg_sum(Amt, SUM).
+    SUM = Variable("SUM")
+    Amt = Variable("Amt")
+    db.create_relation("total_spent2", 1)
+    rule_agg_sum_body = Rule(
+        head=Literal("total_spent2", (SUM,), negated=False),
+        body_literals=[Literal("purchase", (Variable("C"), Variable("O"), Amt), negated=False),
+                       Literal("agg_sum", (Amt, SUM), negated=False)],
+        comparisons=[],
+        aggregate=None
+    )
+    db.add_rule(rule_agg_sum_body)
+
+    # Add a rule using agg_count in the body: num_orders(COUNT) :- purchase(_, _, _), agg_count(Variable("O"), COUNT).
+    COUNT = Variable("COUNT")
+    db.create_relation("num_orders", 1)
+    rule_agg_count_body = Rule(
+        head=Literal("num_orders", (COUNT,), negated=False),
+        body_literals=[Literal("purchase", (Variable("C"), Variable("O"), Amt), negated=False),
+                       Literal("agg_count", (Variable("O"), COUNT), negated=False)],
+        comparisons=[],
+        aggregate=None
+    )
+    db.add_rule(rule_agg_count_body)
+
+    evaluator.evaluate()
+    print("Predicate `total_spent2` (agg_sum in body):")
+    for row in db.get_relation("total_spent2").to_records():
+        print(" ", row)
+    print()
+    print("Predicate `num_orders` (agg_count in body):")
+    for row in db.get_relation("num_orders").to_records():
+        print(" ", row)
+    print()
+
     print("\n---- Done ----")
 
 if __name__ == "__main__":
