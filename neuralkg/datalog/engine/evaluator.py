@@ -674,6 +674,7 @@ class BottomUpEvaluator:
         if (
             len(body_literals) == 1
             and len(head_vars) == len(set(head_vars))
+            and len(head_vars) > 0  # Ensure head_vars is not empty
             and all(isinstance(t, type(head_vars[0])) for t in body_literals[0].terms)
             and all(isinstance(t, type(head_vars[0])) for t in head_vars)
         ):

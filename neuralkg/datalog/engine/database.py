@@ -48,193 +48,154 @@ class DatalogDatabase:
         Parse a query string and execute it against the database.
         Supports single atoms, conjunctions, negations, and comparisons.
         """
+        # Parse the query string using DatalogParser
         from neuralkg.datalog.parser.datalog_parser import DatalogParser
         parser = DatalogParser()
         if not query_str.endswith('.'):
             query_str += '.'
-        import re
-        single_atom_pattern = re.compile(r'^\s*[a-zA-Z_][a-zA-Z0-9_]*\s*\(([^()]*)\)\s*\.?\s*$')
-        if single_atom_pattern.match(query_str.strip()):
-            # Try to parse as a single atom/fact
-            ast = parser.parse(query_str)
-            clause = ast
-            if isinstance(ast, dict) and ast.get('type') == 'program':
-                clauses = ast.get('clauses') or ast.get('statements') or []
-                if clauses:
-                    clause = clauses[0]
-            if isinstance(clause, dict) and clause.get('type') == 'fact':
-                literal = self._ast_atom_to_literal(clause['atom'])
-                return self.query(literal)
-            elif isinstance(clause, dict) and clause.get('type') == 'atom':
-                literal = self._ast_atom_to_literal(clause)
-                return self.query(literal)
-        # Otherwise, synthesize a rule string for complex queries
-        # Parse the query string as a query (conjunction/body) using the new grammar
-        parser = DatalogParser()
-        ast_query = parser.parse(query_str)
-        def extract_var_order_from_query(node):
-            order = []
-            try:
-                from lark.lexer import Token
-            except ImportError:
-                Token = None
-            if Token is not None and isinstance(node, Token):
-                if node.type == "VARIABLE":
-                    order.append(str(node))
-                return order
+        
+        # Parse the query
+        ast = parser.parse(query_str)
+        logger.debug(f"[QUERY_FROM_STRING] AST: {ast}")
+        
+        # Extract variables from the AST
+        user_var_order = []
+        
+        # Helper function to extract variables
+        def extract_variables(node):
+            """Extract variables from an AST node and its children."""
+            vars_found = []
+            # Handle dictionaries (typical AST nodes)
             if isinstance(node, dict):
-                if node.get('type') == 'atom':
-                    for t in node.get('terms', []):
-                        order += extract_var_order_from_query(t)
-                elif node.get('type') == 'negation':
-                    order += extract_var_order_from_query(node['atom'])
+                # Extract variables from atom arguments
+                if node.get('type') == 'atom' and 'args' in node:
+                    for arg in node.get('args', []):
+                        if isinstance(arg, dict) and arg.get('type') == 'variable':
+                            var_name = arg.get('name')
+                            if var_name:
+                                vars_found.append(var_name)
+                # Extract variables from comparisons
                 elif node.get('type') == 'comparison':
-                    order += extract_var_order_from_query(node['left'])
-                    order += extract_var_order_from_query(node['right'])
+                    for side in ['left', 'right']:
+                        if side in node:
+                            # Handle both dict and Token objects
+                            side_node = node[side]
+                            if isinstance(side_node, dict) and side_node.get('type') == 'variable':
+                                var_name = side_node.get('name')
+                                if var_name:
+                                    vars_found.append(var_name)
+                            # If it's a Token object that might represent a variable
+                            elif hasattr(side_node, 'type') and side_node.type == 'VARIABLE':
+                                var_name = getattr(side_node, 'value', None)
+                                if var_name:
+                                    vars_found.append(var_name)
+                # Extract variable directly if this is a variable node
                 elif node.get('type') == 'variable':
-                    order.append(node['name'])
+                    var_name = node.get('name')
+                    if var_name:
+                        vars_found.append(var_name)
+                # Process children recursively
+                for key, value in node.items():
+                    if key not in ['type', 'name']:
+                        vars_found.extend(extract_variables(value))
+            # Handle lists of nodes
             elif isinstance(node, list):
                 for item in node:
-                    order += extract_var_order_from_query(item)
-            return order
-        var_order = []
-        # Handle new 'query' AST type
-        if isinstance(ast_query, dict) and ast_query.get('type') == 'query':
-            var_order = extract_var_order_from_query(ast_query['body'])
-        elif isinstance(ast_query, dict) and ast_query.get('type') == 'program':
-            clauses = ast_query.get('clauses') or ast_query.get('statements') or []
-            if clauses:
-                ast_query = clauses[0]
-            if isinstance(ast_query, dict) and ast_query.get('type') == 'query':
-                var_order = extract_var_order_from_query(ast_query['body'])
-        elif isinstance(ast_query, dict):
-            if ast_query.get('type') == 'fact':
-                ast_query = ast_query['atom']
-            if ast_query.get('type') == 'atom':
-                var_order = extract_var_order_from_query(ast_query)
-            elif ast_query.get('type') == 'rule':
-                body = ast_query['body'] if isinstance(ast_query['body'], list) else [ast_query['body']]
-                for b in body:
-                    var_order += extract_var_order_from_query(b)
-        # Always extract user_var_order from the query body AST, regardless of type
-        # Print the relevant AST node for diagnostics
-        if isinstance(ast_query, dict) and ast_query.get('type') == 'query':
-            query_body_ast = ast_query['body']
-        else:
-            query_body_ast = ast_query
-
-        var_order = extract_var_order_from_query(query_body_ast)
-        # Only keep unique variables in order of first appearance
-        seen = set()
-        user_var_order = []
-        for v in var_order:
-            if v not in seen:
-                user_var_order.append(v)
-                seen.add(v)
-
-        # Guarantee: synthetic rule head uses all variables from user query, in order, with duplicates if present
-        rule_ast = query_body_ast
-        rule_str = self._synthesize_rule_from_query(rule_ast, user_var_order, allow_duplicates=True)
-        parser = DatalogParser()
-        ast = parser.parse(rule_str)
-        # Defensive: if ast is a program, extract the first clause
-        clause = ast
-        if isinstance(ast, dict) and ast.get('type') == 'program':
-            clauses = ast.get('clauses') or ast.get('statements') or []
-            if not clauses:
-                raise ValueError("Synthesized rule parsing produced empty program AST.")
-            clause = clauses[0]
-        if not (isinstance(clause, dict) and clause.get('type') == 'rule'):
-            raise ValueError(f"Synthesized rule parsing did not yield a rule AST: {clause}")
-        # Force the head to use user_var_order as variable names, if provided
-        if user_var_order:
-            from ..model.terms import Variable
-            head_vars = tuple(Variable(name) for name in user_var_order)
-            head = type(self._ast_atom_to_literal(clause['head']))('__query__', head_vars, negated=False)
-        else:
-            head = self._ast_atom_to_literal(clause['head'])
-        body_elems = clause['body'] if isinstance(clause['body'], list) else [clause['body']]
+                    vars_found.extend(extract_variables(item))
+            # Handle Token objects
+            elif hasattr(node, 'type') and node.type == 'VARIABLE':
+                var_name = getattr(node, 'value', None)
+                if var_name:
+                    vars_found.append(var_name)
+            return vars_found
+            
+        # Extract all variables from the AST
+        all_vars = extract_variables(ast)
+        # Remove duplicates while preserving order
+        for var in all_vars:
+            if var and var not in user_var_order:
+                user_var_order.append(var)
+                
+        logger.debug(f"[QUERY_FROM_STRING] Extracted variables: {user_var_order}")
+        
+        # Process the head atom
+        from ..model.literal import Literal
+        from ..model.terms import Variable
+        
+        # Create head terms using variable order
+        head_terms = [Variable(v) for v in user_var_order]
+        
+        # Special handling for __query__ relation - recreate for each query
+        query_pred = "__query__"
+        if query_pred in self._relations:
+            del self._relations[query_pred]
+            
+        # Create synthetic head predicate with all variables
+        head = Literal(query_pred, head_terms)
+        
+        # Extract the body parts from the query AST
         body = []
         comparisons = []
-        for b in body_elems:
-            if not isinstance(b, dict):
-                continue  # skip stray tokens or strings
-            if b['type'] == 'atom':
-                body.append(self._ast_atom_to_literal(b))
-            elif b['type'] == 'negation':
-                body.append(self._ast_atom_to_literal(b['atom'], negated=True))
-            elif b['type'] == 'comparison':
-                left = self._ast_term_to_model(b['left'])
-                right = self._ast_term_to_model(b['right'])
-                from ..model.literal import Comparison
-                comparisons.append(Comparison(left, b['op'], right))
+        
+        # Helper function to extract body parts from the query AST
+        def extract_body_parts(node):
+            nonlocal body, comparisons
+            if isinstance(node, dict):
+                if node.get('type') == 'atom':
+                    body.append(self._ast_atom_to_literal(node))
+                elif node.get('type') == 'negation':
+                    body.append(self._ast_atom_to_literal(node.get('atom', {}), negated=True))
+                elif node.get('type') == 'comparison':
+                    left = self._ast_term_to_model(node.get('left', {}))
+                    right = self._ast_term_to_model(node.get('right', {}))
+                    from ..model.literal import Comparison
+                    comparisons.append(Comparison(left, node.get('op', '='), right))
+                # Process children
+                for key, value in node.items():
+                    if key not in ['type', 'left', 'right']:
+                        extract_body_parts(value)
+            elif isinstance(node, list):
+                for item in node:
+                    extract_body_parts(item)
+        
+        # Extract body parts from the AST
+        extract_body_parts(ast)
+        
         # Add the temporary rule for the query
         rule = self.make_rule(head, body, comparisons)
         self.add_rule(rule)
-        head_pred = head.predicate
-        # Save the current state of the synthetic predicate's relation (if any)
-        prev_relation = None
-        if head_pred in self._relations:
-            prev_relation = self._relations[head_pred][1].copy()
+        
         # Re-run full bottom-up evaluation (fixpoint) including the new rule
         from .evaluator import BottomUpEvaluator
         max_iterations = 10  # You can make this configurable if desired
         evaluator = BottomUpEvaluator(self, max_iterations=max_iterations)
-        try:
-            evaluator.evaluate()
-        except RuntimeError as e:
-            # Clean up before raising
-            self.rules.pop()
-            if prev_relation is not None:
-                schema = self._relations[head_pred][0]
-                self._relations[head_pred] = (schema, prev_relation)
-            else:
-                if head_pred in self._relations:
-                    del self._relations[head_pred]
-            raise RuntimeError(f"Query evaluation exceeded max iterations ({max_iterations}): {e}")
-        # Query the synthetic predicate
-        result = self.query(head)
-        # No mapping/renaming needed: synthetic rule head uses user variable names/order
-        # Remove the temporary rule
-        self.rules.pop()
-        # Restore the synthetic relation to its previous state
-        if prev_relation is not None:
-            schema = self._relations[head_pred][0]
-            self._relations[head_pred] = (schema, prev_relation)
-        else:
-            if head_pred in self._relations:
-                del self._relations[head_pred]
-        logger.debug(f"[QUERY_FROM_STRING] user_var_order: {user_var_order}")
-        logger.debug(f"[QUERY_FROM_STRING] Final result columns before projection: {result.columns()}")
-        logger.debug(f"[QUERY_FROM_STRING] Final result sample rows: {result.to_records()[:5]}")
-        # --- PATCH: Explicitly project and rename to user variable order ---
-        # Always project and rename to user variable order for synthetic queries
-        # Only project if user_var_order is non-empty (i.e., there are variables in the query)
-        if user_var_order and len(user_var_order) > 0:
-            result_cols = result.columns()
-            logger.debug(f"[QUERY_FROM_STRING] user_var_order: {user_var_order}")
-            logger.debug(f"[QUERY_FROM_STRING] result columns: {result_cols}")
-            # If all user_var_order columns exist, project as usual
-            if all(col in result_cols for col in user_var_order):
-                records = result.to_records()
-                projected = [{k: row.get(k, None) for k in user_var_order} for row in records]
-                result = type(result).from_dicts(projected, user_var_order)
-                logger.debug(f"[QUERY_FROM_STRING] Projected columns: {user_var_order}")
-            # If not, but the number of columns matches, project by position
-            elif len(result_cols) == len(user_var_order):
-                logger.debug("[QUERY_FROM_STRING] Column names mismatch but arity matches; projecting by position.")
-                records = result.to_records()
-                projected = [dict(zip(user_var_order, [row[c] for c in result_cols])) for row in records]
-                result = type(result).from_dicts(projected, user_var_order)
-                logger.debug(f"[QUERY_FROM_STRING] Projected by position: {user_var_order}")
-            # Otherwise, fallback to returning all columns
-            else:
-                logger.warning(f"[QUERY_FROM_STRING] Cannot project to user_var_order {user_var_order}, returning all columns: {result_cols}")
-        logger.debug(f"[QUERY_FROM_STRING] Result columns after projection: {result.columns()}")
-        logger.debug(f"[QUERY_FROM_STRING] Result sample rows after projection: {result.to_records()[:5]}")
-        logger.debug(f"[QUERY_FROM_STRING] Result columns after projection: {result.columns()}")
-        logger.debug(f"[QUERY_FROM_STRING] Result sample rows after projection: {result.to_records()[:5]}")
-        return result
+        evaluator.evaluate()
+        
+        # Get the results
+        result = None
+        if query_pred in self._relations:
+            result = self._relations[query_pred][1]
+            
+            # If we have results, rename columns to match the user variable names
+            if result and result.num_rows() > 0:
+                # The query relation has generic column names (arg0, arg1, etc.)
+                # We want to rename them to match the user variable names
+                rename_map = {}
+                for i, var_name in enumerate(user_var_order):
+                    rename_map[f"arg{i}"] = var_name
+                
+                # Rename the columns
+                result = result.rename(rename_map)
+            
+            # Remove the synthetic query rule to avoid cluttering the database
+            self.rules = [r for r in self.rules if r.head.predicate != query_pred]
+            
+            # Return the result frame
+            return result
+        
+        # If no results were found, return an empty frame
+        from ..engine.frame import make_frame
+        return make_frame(columns=user_var_order)
 
     def _synthesize_rule_from_query(self, ast, user_var_order=None, allow_duplicates=False) -> str:
         """
@@ -414,20 +375,28 @@ class DatalogDatabase:
         return Rule(head, body_literals=body, comparisons=comparisons)
 
     def create_relation(self, predicate: str, arity: int, colnames: tuple[str, ...] = None) -> None:
-        logger.debug(f"[DIAG] create_relation called: predicate={predicate}, arity={arity}, colnames={colnames}")
         """
         Ensure a relation named `predicate` of the specified `arity` exists.
         If it already exists, verify the arity matches. Otherwise, create an
         empty Frame with the appropriate column names (defaults to arg* for facts, or variable names for rules).
         """
+        logger.debug(f"[DIAG] create_relation called: predicate={predicate}, arity={arity}, colnames={colnames}")
+        
         if predicate in self._relations:
             schema, frame = self._relations[predicate]
             if schema.arity != arity:
-                raise ValueError(
-                    f"create_relation: '{predicate}' exists with arity {schema.arity}, not {arity}."
-                )
-            # Never overwrite the existing frame or schema
-            return
+                # Special case for __query__ predicate - recreate it with new arity
+                if predicate == "__query__":
+                    logger.debug(f"[CREATE_RELATION] Recreating {predicate} with new arity {arity}")
+                    del self._relations[predicate]
+                else:
+                    raise ValueError(
+                        f"create_relation: '{predicate}' exists with arity {schema.arity}, not {arity}."
+                    )
+            else:
+                # For existing relations with matching arity, we use the existing schema
+                return
+                
         if colnames is None:
             # Default column names: arg0, arg1, ..., arg{arity-1}
             colnames = tuple(f"arg{i}" for i in range(arity))

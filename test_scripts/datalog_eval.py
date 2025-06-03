@@ -113,7 +113,7 @@ def main():
         # 2. Variable appears only in comparison
         "emp_salary(Emp, Salary), Salary > 90000",
         # 3. Variable appears only in negation
-        # "emp_name(Emp, Name), not emp_salary(Emp, Salary)",
+        "emp_name(Emp, Name), not emp_salary(Emp, Salary)",
         # 4. Mix of constants and variables
         # "emp_name(Emp, 'alice'), emp_salary(Emp, Salary)",
         # 5. Permuted variable order
