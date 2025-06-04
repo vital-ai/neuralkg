@@ -78,6 +78,18 @@ class Frame(ABC):
     @abstractmethod
     def num_rows(self) -> int:
         ...
+        
+    @abstractmethod
+    def has_only_nan_values(self, column: str) -> bool:
+        """Check if a column contains only NaN values.
+        
+        Args:
+            column: Column name to check
+            
+        Returns:
+            True if all values in the column are NaN, False otherwise
+        """
+        ...
 
 class PandasFrame(Frame):
     """
@@ -244,6 +256,21 @@ class PandasFrame(Frame):
 
     def __len__(self):
         return len(self._df)
+        
+    def has_only_nan_values(self, column: str) -> bool:
+        """Check if a column contains only NaN values.
+        
+        Args:
+            column: Column name to check
+            
+        Returns:
+            True if all values in the column are NaN, False otherwise
+        """
+        if column not in self._df.columns:
+            return False
+            
+        # Use pandas isna() to check for NaN values in all rows
+        return self._df[column].isna().all()
 
 # By default, we use PandasFrame. To switch, assign PolarsFrame here (once implemented).
 make_frame: Type[Frame] = PandasFrame

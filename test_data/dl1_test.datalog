@@ -95,6 +95,11 @@ emp_name(e_hank, hank).
 emp_age(e_hank, 37).
 emp_salary(e_hank, 83000). // Not eligible (age < 40), salary > 80000
 
+// Employee with name but no salary - for testing negation
+emp_id(e_ian).
+emp_name(e_ian, ian).
+emp_age(e_ian, 45).
+
 edge3(X, Y, W) :-
     edge_id(E),
     edge_source(E, X),
@@ -149,3 +154,52 @@ not_eligible_high_salary(Name, Salary) :-
 // Not eligible employees with Age > 40 (should match gina)
 not_eligible_over_40(Name, Age) :-
     emp_name(Emp, Name), emp_age(Emp, Age), not eligible(Name), Age > 40.
+
+// Sales data for aggregate testing
+sale_id(s1). sale_emp(s1, e_alice). sale_product(s1, laptop). sale_amount(s1, 1200). sale_quantity(s1, 1). sale_date(s1, 20250501).
+sale_id(s2). sale_emp(s2, e_alice). sale_product(s2, monitor). sale_amount(s2, 400). sale_quantity(s2, 2). sale_date(s2, 20250502).
+sale_id(s3). sale_emp(s3, e_alice). sale_product(s3, keyboard). sale_amount(s3, 100). sale_quantity(s3, 1). sale_date(s3, 20250503).
+
+sale_id(s4). sale_emp(s4, e_bob). sale_product(s4, laptop). sale_amount(s4, 1500). sale_quantity(s4, 1). sale_date(s4, 20250501).
+sale_id(s5). sale_emp(s5, e_bob). sale_product(s5, printer). sale_amount(s5, 300). sale_quantity(s5, 1). sale_date(s5, 20250504).
+
+sale_id(s6). sale_emp(s6, e_carol). sale_product(s6, monitor). sale_amount(s6, 350). sale_quantity(s6, 1). sale_date(s6, 20250502).
+sale_id(s7). sale_emp(s7, e_carol). sale_product(s7, monitor). sale_amount(s7, 800). sale_quantity(s7, 2). sale_date(s7, 20250505).
+
+sale_id(s8). sale_emp(s8, e_dave). sale_product(s8, laptop). sale_amount(s8, 2000). sale_quantity(s8, 1). sale_date(s8, 20250503).
+sale_id(s9). sale_emp(s9, e_dave). sale_product(s9, printer). sale_amount(s9, 250). sale_quantity(s9, 1). sale_date(s9, 20250504).
+sale_id(s10). sale_emp(s10, e_dave). sale_product(s10, keyboard). sale_amount(s10, 80). sale_quantity(s10, 1). sale_date(s10, 20250505).
+
+sale_id(s11). sale_emp(s11, e_eve). sale_product(s11, laptop). sale_amount(s11, 1800). sale_quantity(s11, 1). sale_date(s11, 20250501).
+sale_id(s12). sale_emp(s12, e_eve). sale_product(s12, monitor). sale_amount(s12, 500). sale_quantity(s12, 1). sale_date(s12, 20250502).
+
+// Project data for grouping tests
+project_id(p1). project_name(p1, alpha). project_budget(p1, 50000). project_status(p1, active).
+project_id(p2). project_name(p2, beta). project_budget(p2, 75000). project_status(p2, active).
+project_id(p3). project_name(p3, gamma). project_budget(p3, 100000). project_status(p3, pending).
+project_id(p4). project_name(p4, delta). project_budget(p4, 30000). project_status(p4, completed).
+project_id(p5). project_name(p5, epsilon). project_budget(p5, 60000). project_status(p5, active).
+
+// Assignment of employees to projects with hours worked
+assignment_id(a1). assignment_emp(a1, e_alice). assignment_project(a1, p1). assignment_hours(a1, 120).
+assignment_id(a2). assignment_emp(a2, e_alice). assignment_project(a2, p2). assignment_hours(a2, 80).
+assignment_id(a3). assignment_emp(a3, e_bob). assignment_project(a3, p1). assignment_hours(a3, 100).
+assignment_id(a4). assignment_emp(a4, e_bob). assignment_project(a4, p3). assignment_hours(a4, 150).
+assignment_id(a5). assignment_emp(a5, e_carol). assignment_project(a5, p2). assignment_hours(a5, 200).
+assignment_id(a6). assignment_emp(a6, e_carol). assignment_project(a6, p4). assignment_hours(a6, 50).
+assignment_id(a7). assignment_emp(a7, e_dave). assignment_project(a7, p5). assignment_hours(a7, 180).
+assignment_id(a8). assignment_emp(a8, e_eve). assignment_project(a8, p3). assignment_hours(a8, 120).
+assignment_id(a9). assignment_emp(a9, e_eve). assignment_project(a9, p5). assignment_hours(a9, 90).
+
+// Simplified relations for queries
+sale(Emp, Product, Amount, Quantity, Date) :- 
+    sale_id(S), sale_emp(S, Emp), sale_product(S, Product), 
+    sale_amount(S, Amount), sale_quantity(S, Quantity), sale_date(S, Date).
+
+project(PID, Name, Budget, Status) :- 
+    project_id(PID), project_name(PID, Name), 
+    project_budget(PID, Budget), project_status(PID, Status).
+    
+assignment(Emp, Project, Hours) :- 
+    assignment_id(A), assignment_emp(A, Emp), 
+    assignment_project(A, Project), assignment_hours(A, Hours).

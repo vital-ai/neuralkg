@@ -1,11 +1,19 @@
-from typing import Any
+import logging
+import json
+from pathlib import Path
+from typing import Dict, List, Set, Tuple, Union, Optional, Any
+from tqdm import tqdm
+
 from ..model.schema import RelationSchema
 from .frame import Frame, make_frame
 from ..model.rule import Rule
-from ..model.literal import Literal
+from ..model.literal import Literal, Comparison
 from ..model.terms import Variable, Constant
+from ..parser.datalog_parser import DatalogParser
 
-import logging
+# Define aggregate function names here to avoid circular import
+AGGREGATE_FUNCS = ['agg_sum', 'agg_avg', 'agg_count', 'agg_max', 'agg_min']
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 if not logger.hasHandlers():
@@ -13,6 +21,52 @@ if not logger.hasHandlers():
     formatter = logging.Formatter('[%(levelname)s] %(message)s')
     handler.setFormatter(formatter)
     logger.addHandler(handler)
+
+class QueryResult:
+    """A wrapper for query results that provides a consistent interface regardless
+    of whether the underlying frame is None, empty, or contains data.
+    
+    This ensures that calling code can always access methods like num_rows(), columns(),
+    and to_records() without checking for None first.
+    """
+    def __init__(self, frame=None, status="success", message=""):
+        self.frame = frame
+        self.status = status  # success, empty, error
+        self.message = message
+    
+    def is_empty(self) -> bool:
+        """Returns True if the result is empty (no rows)"""
+        return self.frame is None or self.frame.num_rows() == 0
+    
+    def has_error(self) -> bool:
+        """Returns True if there was an error during query execution"""
+        return self.status == "error"
+    
+    def num_rows(self) -> int:
+        """Returns the number of rows in the result"""
+        return 0 if self.frame is None else self.frame.num_rows()
+    
+    def columns(self) -> List[str]:
+        """Returns the column names in the result"""
+        return [] if self.frame is None else self.frame.columns()
+    
+    def to_records(self) -> List[Dict[str, Any]]:
+        """Returns the result data as a list of dictionaries"""
+        return [] if self.frame is None else self.frame.to_records()
+    
+    @classmethod
+    def empty(cls, columns=None):
+        """Create an empty result with the specified schema"""
+        if columns:
+            frame = make_frame.from_dicts([], columns=columns)
+        else:
+            frame = make_frame.from_dicts([], columns=[])
+        return cls(frame=frame, status="empty", message="No results found")
+    
+    @classmethod
+    def error(cls, message):
+        """Create an error result with the specified message"""
+        return cls(frame=None, status="error", message=message)
 
 class DatalogDatabase:
     """
@@ -43,219 +97,385 @@ class DatalogDatabase:
         ast = parser.parse(program_str)
         self._load_from_ast(ast)
 
-    def query_from_string(self, query_str: str) -> Frame:
-        """
-        Parse a query string and execute it against the database.
-        Supports single atoms, conjunctions, negations, and comparisons.
-        """
-        # Parse the query string using DatalogParser
-        from neuralkg.datalog.parser.datalog_parser import DatalogParser
-        parser = DatalogParser()
-        if not query_str.endswith('.'):
-            query_str += '.'
+    def _extract_variables(self, query_body):
+        """Extract variables from a list of literals."""
+        variables = []
+        for lit in query_body:
+            for term in lit.terms:
+                if hasattr(term, 'name') and term not in variables:  # Variable objects have 'name' attribute
+                    variables.append(term)
+        return variables
         
-        # Parse the query
-        ast = parser.parse(query_str)
-        logger.debug(f"[QUERY_FROM_STRING] AST: {ast}")
+    def _extract_variables_from_dict(self, node):
+        """Extract all variables from a dictionary representation of a query AST node.
         
-        # Extract variables from the AST
-        user_var_order = []
-        
-        # Helper function to extract variables
-        def extract_variables(node):
-            """Extract variables from an AST node and its children."""
-            vars_found = []
-            # Handle dictionaries (typical AST nodes)
-            if isinstance(node, dict):
-                # Extract variables from atom arguments
-                if node.get('type') == 'atom' and 'args' in node:
-                    for arg in node.get('args', []):
-                        if isinstance(arg, dict) and arg.get('type') == 'variable':
-                            var_name = arg.get('name')
-                            if var_name:
-                                vars_found.append(var_name)
-                # Extract variables from comparisons
-                elif node.get('type') == 'comparison':
-                    for side in ['left', 'right']:
-                        if side in node:
-                            # Handle both dict and Token objects
-                            side_node = node[side]
-                            if isinstance(side_node, dict) and side_node.get('type') == 'variable':
-                                var_name = side_node.get('name')
-                                if var_name:
-                                    vars_found.append(var_name)
-                            # If it's a Token object that might represent a variable
-                            elif hasattr(side_node, 'type') and side_node.type == 'VARIABLE':
-                                var_name = getattr(side_node, 'value', None)
-                                if var_name:
-                                    vars_found.append(var_name)
-                # Extract variable directly if this is a variable node
-                elif node.get('type') == 'variable':
-                    var_name = node.get('name')
-                    if var_name:
-                        vars_found.append(var_name)
-                # Process children recursively
-                for key, value in node.items():
-                    if key not in ['type', 'name']:
-                        vars_found.extend(extract_variables(value))
-            # Handle lists of nodes
-            elif isinstance(node, list):
-                for item in node:
-                    vars_found.extend(extract_variables(item))
-            # Handle Token objects
-            elif hasattr(node, 'type') and node.type == 'VARIABLE':
-                var_name = getattr(node, 'value', None)
-                if var_name:
-                    vars_found.append(var_name)
-            return vars_found
+        Args:
+            node: Dictionary representing an AST node
             
-        # Extract all variables from the AST
-        all_vars = extract_variables(ast)
-        # Remove duplicates while preserving order
-        for var in all_vars:
-            if var and var not in user_var_order:
-                user_var_order.append(var)
+        Returns:
+            Set of variable names found in the node
+        """
+        vars = set()
+        if isinstance(node, dict):
+            if node.get('type') == 'atom':
+                for term in node.get('terms', []):
+                    vars.update(self._extract_variables_from_dict(term))
+            elif node.get('type') == 'negation':
+                vars.update(self._extract_variables_from_dict(node.get('atom', {})))
+            elif node.get('type') == 'comparison':
+                vars.update(self._extract_variables_from_dict(node.get('left', {})))
+                vars.update(self._extract_variables_from_dict(node.get('right', {})))
+            elif node.get('type') == 'variable':
+                vars.add(node.get('name'))
+        elif isinstance(node, list):
+            for item in node:
+                vars.update(self._extract_variables_from_dict(item))
+        return vars
+        
+    def _convert_dict_to_literal(self, node):
+        """Convert a dictionary representation of a literal to a Literal or Comparison object.
+        
+        Args:
+            node: Dictionary representing a literal AST node or a Lark Token
+            
+        Returns:
+            Literal/Comparison object or None if conversion fails
+        """
+        from ..model.literal import Literal, Comparison
+        from ..model.terms import Variable, Constant
+        
+        # Try to handle Lark.Token objects directly
+        try:
+            from lark.lexer import Token
+            if isinstance(node, Token):
+                if node.type == "VARIABLE":
+                    return Variable(str(node))
+                elif node.type == "CONSTANT":
+                    return Constant(str(node))
+                elif node.type == "NUMBER":
+                    return Constant(int(node))
+                elif node.type == "STRING":
+                    # Remove quotes and unescape
+                    s = str(node)[1:-1].encode("utf-8").decode("unicode_escape")
+                    return Constant(s)
+        except ImportError:
+            pass
+            
+        if isinstance(node, dict):
+            # Handle regular atom
+            if node.get('type') == 'atom':
+                predicate = node.get('name')
+                terms = []
+                for term in node.get('terms', []):
+                    # Convert each term recursively to handle nested structures
+                    term_obj = self._ast_term_to_model(term)
+                    if term_obj is not None:
+                        terms.append(term_obj)
+                return Literal(predicate, terms)
+            # Handle negation
+            elif node.get('type') == 'negation':
+                atom_lit = self._convert_dict_to_literal(node.get('atom', {}))
+                if atom_lit and isinstance(atom_lit, Literal):
+                    # Can only negate Literals, not Comparisons
+                    return Literal(atom_lit.predicate, atom_lit.terms, negated=True)
+                return atom_lit
+            # Handle comparison (create a Comparison object)
+            elif node.get('type') == 'comparison':
+                op = node.get('op')
+                left = node.get('left', {})
+                right = node.get('right', {})
                 
-        logger.debug(f"[QUERY_FROM_STRING] Extracted variables: {user_var_order}")
+                # Convert left and right to terms
+                left_term = self._ast_term_to_model(left)
+                right_term = self._ast_term_to_model(right)
+                    
+                if left_term and right_term:
+                    # Create a Comparison object
+                    return Comparison(left_term, op, right_term)
+        return None
         
-        # Process the head atom
-        from ..model.literal import Literal
-        from ..model.terms import Variable
+    def _ast_term_to_model(self, term):
+        """Accepts a term AST node or Lark Token and returns Variable or Constant"""
+        from ..model.terms import Variable, Constant
         
-        # Create head terms using variable order
-        head_terms = [Variable(v) for v in user_var_order]
-        
-        # Special handling for __query__ relation - recreate for each query
-        query_pred = "__query__"
-        if query_pred in self._relations:
-            del self._relations[query_pred]
+        # Handle Lark Token directly
+        try:
+            from lark.lexer import Token
+            if isinstance(term, Token):
+                if term.type == "VARIABLE":
+                    return Variable(str(term))
+                elif term.type == "CONSTANT":
+                    return Constant(str(term))
+                elif term.type == "NUMBER":
+                    return Constant(int(term))
+                elif term.type == "STRING":
+                    # Remove quotes and unescape
+                    s = str(term)[1:-1].encode("utf-8").decode("unicode_escape")
+                    return Constant(s)
+        except (ImportError, AttributeError):
+            pass
             
-        # Create synthetic head predicate with all variables
-        head = Literal(query_pred, head_terms)
+        if isinstance(term, dict):
+            if term.get('type') == 'variable':
+                return Variable(term.get('name'))
+            elif term.get('type') == 'number':
+                return Constant(term.get('value'))
+            elif term.get('type') == 'string':
+                return Constant(term.get('value'))
+            elif term.get('type') == 'constant':
+                return Constant(term.get('value'))
         
-        # Extract the body parts from the query AST
-        body = []
-        comparisons = []
-        
-        # Helper function to extract body parts from the query AST
-        def extract_body_parts(node):
-            nonlocal body, comparisons
-            if isinstance(node, dict):
-                if node.get('type') == 'atom':
-                    body.append(self._ast_atom_to_literal(node))
-                elif node.get('type') == 'negation':
-                    body.append(self._ast_atom_to_literal(node.get('atom', {}), negated=True))
-                elif node.get('type') == 'comparison':
-                    left = self._ast_term_to_model(node.get('left', {}))
-                    right = self._ast_term_to_model(node.get('right', {}))
-                    from ..model.literal import Comparison
-                    comparisons.append(Comparison(left, node.get('op', '='), right))
-                # Process children
-                for key, value in node.items():
-                    if key not in ['type', 'left', 'right']:
-                        extract_body_parts(value)
-            elif isinstance(node, list):
-                for item in node:
-                    extract_body_parts(item)
-        
-        # Extract body parts from the AST
-        extract_body_parts(ast)
-        
-        # Add the temporary rule for the query
-        rule = self.make_rule(head, body, comparisons)
-        self.add_rule(rule)
-        
-        # Re-run full bottom-up evaluation (fixpoint) including the new rule
-        from .evaluator import BottomUpEvaluator
-        max_iterations = 10  # You can make this configurable if desired
-        evaluator = BottomUpEvaluator(self, max_iterations=max_iterations)
-        evaluator.evaluate()
-        
-        # Get the results
-        result = None
-        if query_pred in self._relations:
-            result = self._relations[query_pred][1]
+        # Fallback
+        try:
+            return Constant(str(term))
+        except:
+            return None
+
+    def query_from_string(self, query_str):
+        """Execute a query from a string.
+
+        Args:
+            query_str: A Datalog query string.
+
+        Returns:
+            A QueryResult object containing the result of the query.
+        """
+        try:
+            logger.debug(f"[QUERY_STRING] Parsing query: {query_str}")
+            parser = DatalogParser()
+            query_result = parser.parse(query_str)
             
-            # If we have results, rename columns to match the user variable names
-            if result and result.num_rows() > 0:
-                # The query relation has generic column names (arg0, arg1, etc.)
-                # We want to rename them to match the user variable names
-                rename_map = {}
-                for i, var_name in enumerate(user_var_order):
-                    rename_map[f"arg{i}"] = var_name
+            # Handle case where parse result might be None
+            if not query_result:
+                logger.error(f"[QUERY_STRING] Failed to parse query: {query_str}")
+                return QueryResult.error(f"Failed to parse query: {query_str}")
                 
-                # Rename the columns
-                result = result.rename(rename_map)
+            # Handle various query result structures from the parser
+            if isinstance(query_result, dict):
+                # Check for program structure with clauses (common for single-predicate queries)
+                if query_result.get('type') == 'program' and 'clauses' in query_result:
+                    # For single query atoms like 'light_edge(X, Y).'
+                    clauses = query_result.get('clauses', [])
+                    if len(clauses) == 1 and clauses[0].get('type') == 'fact':
+                        atom = clauses[0].get('atom')
+                        if atom:
+                            query_body = [atom]
+                        else:
+                            logger.error(f"[QUERY_STRING] Invalid atom in program structure: {query_result}")
+                            return QueryResult.error(f"Invalid atom in query: {query_str}")
+                    else:
+                        # Multiple clauses or not a fact - unexpected in a query
+                        logger.error(f"[QUERY_STRING] Unexpected clauses in program structure: {clauses}")
+                        return QueryResult.error(f"Invalid query structure: {query_str}")
+                # Direct atom structure
+                elif query_result.get('type') == 'atom':
+                    query_body = [query_result]
+                # Complex query with explicit body field
+                elif 'body' in query_result:
+                    query_body = query_result.get('body', [])
+                else:
+                    logger.error(f"[QUERY_STRING] Unexpected dictionary structure: {query_result}")
+                    return QueryResult.error(f"Invalid query structure: {query_str}")
+            # List of atoms (comma-separated predicates)
+            elif isinstance(query_result, list):
+                query_body = query_result
+            else:
+                logger.error(f"[QUERY_STRING] Unexpected query structure: {query_result}")
+                return QueryResult.error(f"Invalid query structure: {query_str}")
+                
+            logger.debug(f"[QUERY_STRING] Parsed query body: {query_body}")
             
-            # Remove the synthetic query rule to avoid cluttering the database
-            self.rules = [r for r in self.rules if r.head.predicate != query_pred]
+            # Create a synthetic head predicate and construct a rule with the body
+            # Extract all variables from the query body
+            variables = set()
+            for lit in query_body:
+                if isinstance(lit, dict):
+                    extracted_vars = self._extract_variables_from_dict(lit)
+                    variables.update(extracted_vars)
+                    
+            # Convert query_body dictionary into a list of proper Literal objects
+            body_literals = []
+            comparisons = []
             
-            # Return the result frame
-            return result
+            for lit in query_body:
+                if isinstance(lit, dict):
+                    # Convert dictionary literals to proper Literal objects
+                    body_lit = self._convert_dict_to_literal(lit)
+                    if body_lit:
+                        if isinstance(body_lit, Comparison):
+                            comparisons.append(body_lit)
+                        else:
+                            body_literals.append(body_lit)
+            
+            # Check if this is an aggregate query
+            has_aggregates = False
+            agg_result_vars = []
+            for lit in body_literals:
+                if hasattr(lit, 'negated') and not lit.negated and lit.predicate in ['agg_sum', 'agg_avg', 'agg_count', 'agg_max', 'agg_min']:
+                    has_aggregates = True
+                    # Last term is the result variable
+                    if lit.terms and hasattr(lit.terms[-1], 'name'):
+                        agg_result_vars.append(lit.terms[-1].name)
+            
+            logger.debug(f"[QUERY_STRING] Has aggregates: {has_aggregates}, Agg result vars: {agg_result_vars}")
+
+            # Check for negated literals in the query
+            neg_literals = [lit for lit in body_literals if hasattr(lit, 'negated') and lit.negated]
+            
+            # Check if this is a ground query (no variables)
+            is_ground_query = True
+            for lit in body_literals:
+                for term in lit.terms:
+                    if isinstance(term, Variable):
+                        is_ground_query = False
+                        break
+                if not is_ground_query:
+                    break
+                    
+            # Determine which variables should be in the query head
+            if is_ground_query:
+                # For ground queries like emp_name('e_bob', 'bob').
+                # We'll add a special variable indicating if the query succeeded
+                head_vars = [Variable("proved")]
+                logger.debug(f"[QUERY_STRING] Detected ground query, using special 'proved' variable")
+            elif has_aggregates:
+                # For an aggregate query, extract variables from the aggregate predicates
+                # and include any grouping variables as head variables for projection
+                query_vars = set()
+                for lit in body_literals:
+                    if lit.predicate in ['agg_sum', 'agg_avg', 'agg_count', 'agg_max', 'agg_min'] and len(lit.terms) >= 3:
+                        # Add the aggregate result variable
+                        query_vars.add(lit.terms[-1])
+                        # Add any group-by variables
+                        for i in range(len(lit.terms) - 2):
+                            query_vars.add(lit.terms[i])
+                head_vars = list(query_vars)
+            elif neg_literals:
+                # For negation queries, use all variables from positive literals as head variables
+                pos_vars = set()
+                for lit in [l for l in body_literals if not (hasattr(l, 'negated') and l.negated)]:
+                    for term in lit.terms:
+                        if isinstance(term, Variable):
+                            pos_vars.add(term)
+                head_vars = list(pos_vars) if pos_vars else [Variable("__dummy__")]
+            else:
+                # For regular queries without aggregation or negation, use all variables from the literals
+                # Ensure we use the variables specified by the user
+                if variables:
+                    head_vars = [Variable(var) for var in variables]
+                else:
+                    # If no variables were specified, collect all variables from positive literals
+                    all_vars = set()
+                    for lit in [l for l in body_literals if not (hasattr(l, 'negated') and l.negated)]:
+                        for term in lit.terms:
+                            if isinstance(term, Variable):
+                                all_vars.add(term)
+                    head_vars = list(all_vars) if all_vars else [Variable("__dummy__")]
+                
+            # Create a synthetic head literal with the appropriate variables
+            head = Literal("__query__", head_vars)
+            
+            # Create a rule with the head and body literals, and add comparisons separately
+            query_rule = Rule(head=head, body_literals=body_literals, comparisons=comparisons)
+            logger.debug(f"[QUERY_STRING] Created query rule: {query_rule}")
+
+            # Create an evaluator and evaluate the query
+            # Import here to avoid circular import
+            from .evaluator import BottomUpEvaluator
+            
+            # Temporarily redirect warnings for this block if it's an aggregate query
+            if has_aggregates:
+                old_log_level = logger.level
+                logger.setLevel(logging.ERROR)  # Suppress warnings temporarily
+                
+            evaluator = BottomUpEvaluator(self)  # Pass the database, not just relations
+            evaluator._evaluate_rule(query_rule)  # Use _evaluate_rule method with underscore
+            
+            # Restore log level if needed
+            if has_aggregates:
+                logger.setLevel(old_log_level)
+                
+            logger.debug(f"[QUERY_STRING] Evaluated query rule")
+
+            # Get the result from the evaluator
+            if "__query__" in evaluator._full:
+                result = evaluator._full["__query__"]
+                logger.debug(f"[QUERY_STRING] Found result: {result.num_rows()} rows")
+
+                # Handle empty result case
+                if result.num_rows() == 0:
+                    logger.debug(f"[QUERY_STRING] Empty result - returning QueryResult.empty")
+                    return QueryResult.empty()
+
+                # Remove placeholder column if it exists
+                if "__dummy__" in result.columns():
+                    logger.debug(f"[QUERY_STRING] Removing dummy column")
+                    # Skip return here
+
+                # For aggregate queries, we need special handling
+                if has_aggregates:
+                    # Check for NaN values in the result using the Frame implementation
+                    nan_columns = []
+                    all_columns = result.columns()
+                    for col in all_columns:
+                        try:
+                            # Use the Frame implementation to check for NaN-only columns
+                            if result.has_only_nan_values(col):
+                                nan_columns.append(col)
+                        except Exception as e:
+                            logger.debug(f"[QUERY_STRING] Error checking NaN in column {col}: {e}")
+                            continue
+
+                    # Filter out columns that contain only NaN values
+                    if nan_columns:
+                        logger.debug(f"[QUERY_STRING] Found NaN columns: {nan_columns}, filtering them out")
+                        good_columns = [col for col in all_columns if col not in nan_columns]
+                        result = result.project(good_columns)
+                        logger.debug(f"[QUERY_STRING] After filtering, columns are: {result.columns()}")
+                    
+                    # Make sure the result includes the aggregate result variables
+                    for var in agg_result_vars:
+                        if var not in result.columns():
+                            logger.warning(f"[QUERY_STRING] Aggregate result variable {var} not found in result columns")
+
+                logger.debug(f"[QUERY_STRING] Returning QueryResult with columns: {result.columns()}")
+                
+                # Clean up __dummy__ column if it exists and isn't the only column
+                columns = result.columns()
+                if '__dummy__' in columns and len(columns) > 1:
+                    # Remove the __dummy__ column as it's just an implementation detail
+                    columns_to_keep = [col for col in columns if col != '__dummy__']
+                    result = result[columns_to_keep]
+                    logger.debug(f"[QUERY_STRING] Removed __dummy__ column, final columns: {result.columns()}")
+                    
+                return QueryResult(result)
+            else:
+                logger.debug(f"[QUERY_STRING] No result - returning QueryResult.empty")
+                return QueryResult.empty()
+        except Exception as e:
+            logger.error(f"[QUERY_STRING] Error executing query: {e}", exc_info=True)
+            return QueryResult.error(str(e))
+
+    def _extract_variables(self, query_body):
+        """Extract all variables from a list of literals in the query body.
         
-        # If no results were found, return an empty frame
-        from ..engine.frame import make_frame
-        return make_frame(columns=user_var_order)
-
-    def _synthesize_rule_from_query(self, ast, user_var_order=None, allow_duplicates=False) -> str:
+        This method is designed to work with parsed dict AST nodes, handling nested structures.
+        
+        Args:
+            query_body: A list of parsed AST nodes (dicts) representing the query body
+            
+        Returns:
+            A list of Variable objects found in the query body
         """
-        Given an AST for a conjunction/negation/comparison query, synthesize a Datalog rule string
-        with a synthetic head predicate and all variables in the body as arguments.
-        """
-        import re
-        def extract_vars(node):
-            vars = set()
-            if isinstance(node, dict):
-                if node.get('type') == 'atom':
-                    for t in node.get('terms', []):
-                        vars |= extract_vars(t)
-                elif node.get('type') == 'negation':
-                    vars |= extract_vars(node['atom'])
-                elif node.get('type') == 'comparison':
-                    vars |= extract_vars(node['left'])
-                    vars |= extract_vars(node['right'])
-                elif node.get('type') == 'variable':
-                    vars.add(node['name'])
-                elif node.get('type') == 'number' or node.get('type') == 'constant' or node.get('type') == 'string':
-                    pass
-            elif isinstance(node, list):
-                for item in node:
-                    vars |= extract_vars(item)
-            return vars
+        from .model import Variable
+        variables = []
+        for body_item in query_body:
+            if isinstance(body_item, dict):
+                extracted = self._extract_variables_from_dict(body_item)
+                variables.extend([Variable(var_name) for var_name in extracted])
+        return variables
 
-        # The body can be a list of atoms/negations/comparisons or a single dict
-        body_items = ast if isinstance(ast, list) else [ast]
-        vars_in_body = set()
-        for item in body_items:
-            vars_in_body |= extract_vars(item)
-        # ALWAYS use user_var_order for the head, in order and with duplicates if present
-        if user_var_order is not None and len(user_var_order) > 0:
-            head_vars = user_var_order
-        else:
-            head_vars = sorted(vars_in_body)
-        head = f"__query__({', '.join(head_vars)})" if head_vars else "__query__()"
-        import json
-        # Synthesize the body string
-        def ast_to_str(node):
-            if isinstance(node, dict):
-                t = node.get('type')
-                if t == 'atom':
-                    args = ', '.join(ast_to_str(arg) for arg in node['terms'])
-                    return f"{node['name']}({args})"
-                elif t == 'negation':
-                    return f"not {ast_to_str(node['atom'])}"
-                elif t == 'comparison':
-                    return f"{ast_to_str(node['left'])} {node['op']} {ast_to_str(node['right'])}"
-                elif t == 'variable':
-                    return node['name']
-                elif t == 'number' or t == 'constant' or t == 'string':
-                    return str(node['value']) if 'value' in node else str(node)
-            elif isinstance(node, list):
-                return ', '.join(ast_to_str(item) for item in node)
-            return str(node)
 
-        body_str = ast_to_str(ast)
-        return f"{head} :- {body_str}."
 
     def _load_from_ast(self, ast):
         # Accepts AST as returned by DatalogParser

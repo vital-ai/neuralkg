@@ -24,6 +24,26 @@ class Rule:
     body_literals: list[Literal] = field(default_factory=list)
     comparisons: list[Comparison] = field(default_factory=list)
     aggregate: Optional[AggregateSpec] = None
+    _has_aggregates: bool = field(default=False)
+    _available_vars_after_agg: set = field(default_factory=set)
+    
+    @property
+    def has_aggregates(self) -> bool:
+        """Returns True if this rule contains aggregate predicates."""
+        return self._has_aggregates
+    
+    @has_aggregates.setter
+    def has_aggregates(self, value: bool):
+        self._has_aggregates = value
+    
+    @property
+    def available_vars_after_agg(self) -> set:
+        """Returns the set of variables available after aggregation."""
+        return self._available_vars_after_agg
+    
+    @available_vars_after_agg.setter
+    def available_vars_after_agg(self, value: set):
+        self._available_vars_after_agg = value
 
     def __repr__(self) -> str:
         parts: list[str] = []

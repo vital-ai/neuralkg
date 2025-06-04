@@ -191,16 +191,25 @@ class BottomUpEvaluator:
             self._delta[pred] = make_frame.empty(list(colnames))
         return self._delta[pred]
 
-    def _evaluate_positive_body(self, body_literals: list[Literal], comparisons=None) -> tuple[Frame, dict[Variable, str]]:
+    def _evaluate_positive_body(
+        self, body_literals: list[Literal], comparisons: list[Comparison] = None
+    ) -> tuple[Frame, dict]:
+        """Evaluate the positive portion of a rule body.
+
+        Args:
+            body_literals: list[Literal]
+            comparisons: list[Comparison] (optional)
+
+        Returns:
+            Tuple of (result frame, varmap)
         """
-        Given a list of positive (non-negated) Literals, compute the join of their current 'full' tables.
-        Returns (combined_frame, var_to_column_map). var_to_column_map maps each Variable → column name in the combined_frame.
-        """
+        # Filter out aggregate predicates - they will be processed later
+        regular_literals = [lit for lit in body_literals if lit.predicate not in AGGREGATE_FUNCS]
         logger.debug(f"[FLOW][POSBODY] Entered _evaluate_positive_body for body_literals: {body_literals} and comparisons: {comparisons}")
-        logger.debug(f"[EVAL][POSBODY][START] Body literals: {body_literals}, Comparisons: {comparisons}")
+        logger.debug(f"[EVAL][POSBODY][START] Body literals: {regular_literals}, Comparisons: {comparisons}")
         
-        if not body_literals:
-            logger.debug(f"[FLOW][POSBODY] No positive body literals, returning all-true dummy frame.")
+        if len(regular_literals) == 0:
+            logger.debug(f"[FLOW][POSBODY] No regular (non-aggregate) body literals, returning all-true dummy frame.")
             dummy = make_frame.empty([])
             logger.debug(f"[FLOW][POSBODY] Exiting _evaluate_positive_body with columns: {dummy.columns()} and varmap: {{}}")
             return dummy, {}
@@ -210,7 +219,7 @@ class BottomUpEvaluator:
         var_maps = []  # Variable-to-column mapping for each literal
         
         # STEP 1: Prepare tables for each literal with proper renaming and filtering
-        for idx, lit in enumerate(body_literals):
+        for idx, lit in enumerate(regular_literals):
             pred = lit.predicate
             ar = lit.arity()
             logger.debug(f"[POSBODY][LIT{idx}] Processing literal: {lit} with predicate {pred}")
@@ -381,57 +390,117 @@ class BottomUpEvaluator:
         return combined, final_varmap
 
     def _filter_negative_literals(self, result, varmap, negated_literals):
-        """
-        For each negated literal, filter out rows from `result` that appear in the negated relation.
-        Columns in the negated relation are renamed to match the current internal varmap for join keys.
-        Defensive logging and robust handling of missing variables/columns included.
-        """
-        orig_columns = result.columns()
-        for lit in negated_literals:
-            pred = lit.predicate
-            ar = lit.arity()
-            schema, _ = self.db._relations[pred]
-            colnames = schema.colnames
-            full_tbl = self._get_full(pred)
-            # Defensive: ensure columns exist
-            missing_before = [c for c in colnames if c not in full_tbl.columns()]
-            if missing_before:
-                logger.error(f"[NEG][ERROR] Predicate '{pred}': missing columns before rename: {missing_before}. Available: {full_tbl.columns()}.")
-            full_tbl = full_tbl[list(colnames)]
+        """Filter result based on negated literals.
 
-            # Build mapping: negated relation positional column -> internal column name from varmap
-            neg_col_rename = {}
-            join_left_cols = []
-            join_right_cols = []
-            for i, t in enumerate(lit.terms):
-                if isinstance(t, Variable):
-                    if t in varmap:
-                        neg_col_rename[colnames[i]] = varmap[t]
-                        join_left_cols.append(varmap[t])
-                        join_right_cols.append(varmap[t])
+        Parameters
+        ----------
+        result : Frame
+            Current result table.
+        varmap : dict
+            Mapping from variables to columns.
+        negated_literals : list
+            List of negated literals.
+
+        Returns
+        -------
+        Frame
+            Filtered result.
+        """
+        # For each negated literal, perform anti-join filtering
+        orig_columns = result.columns()  # Remember original columns for later
+        
+        for lit in negated_literals:
+            # Skip if result is empty, nothing to filter
+            if result.num_rows() == 0:
+                logger.debug(f"[NEG] Skipping negation filtering for {lit}, result is empty")
+                continue
+                
+            logger.debug(f"[NEG][FILTER] Filtering by negated literal: {lit}")
+
+            # Get the full relation for the negated literal
+            full_tbl = self._get_full(lit.predicate)
+            if full_tbl is None:
+                logger.warning(f"[NEG][WARN] Negated predicate {lit.predicate} not found in database")
+                continue
+            
+            # Get the predicate signature (arity)
+            pred_sig = [f"arg{i}" for i in range(lit.arity())]
+            
+            # If the full table is empty, nothing is excluded by negation
+            if full_tbl.num_rows() == 0:
+                logger.debug(f"[NEG][EMPTY] Negated table {lit.predicate} is empty, no filtering needed")
+                continue
+            
+            # Extract shared variables between result and negated relation
+            # These are variables that appear in both positive and negated literals
+            shared_vars = []
+            join_cols_left = []  # Columns from result table
+            join_cols_right = []  # Columns from negated table
+            
+            # Get the existing column names of the full table
+            existing_colnames = full_tbl.columns()
+            logger.debug(f"[NEG][JOIN] Negated table original columns: {existing_colnames}")
+            
+            # We'll use the existing column names from the full table
+            # No need to rename at this stage, we'll map when creating join conditions
+            
+            # Map variables in the negated literal to their position in the relation
+            var_positions = {}
+            for i, term in enumerate(lit.terms):
+                if isinstance(term, Variable):
+                    var_positions[term] = i
+            
+            # CRITICAL FIX: For each variable in the negated literal, only use it for joining
+            # if it's in the result columns (meaning it appeared in positive literals)
+            for term, pos in var_positions.items():
+                if term in varmap:
+                    col_name = varmap[term]  # Column name in result table
+                    # Only use variables that are actually in the result columns from positive literals
+                    if col_name in result.columns() and not col_name.startswith('var_') and pos < len(existing_colnames):
+                        shared_vars.append(term)
+                        join_cols_left.append(col_name)  # Column in result table
+                        join_cols_right.append(existing_colnames[pos])  # Actual column in negated table
+                        logger.debug(f"[NEG][JOIN] Found shared variable {term} for join: {col_name} = {existing_colnames[pos]}")
                     else:
-                        logger.warning(f"[NEG][WARN] Variable {t} in negated literal {lit} not found in varmap {varmap}")
-            # Defensive logging
-            if not join_left_cols:
-                logger.warning(f"[NEG][WARN] No join keys found for negated literal {lit} with varmap {varmap}")
-            for col in join_left_cols:
-                if col not in result.columns():
-                    logger.error(f"[NEG][ERROR] Join key '{col}' not in result columns: {result.columns()}")
-            # Rename only the columns needed for the join
-            full_tbl_renamed = full_tbl.rename(neg_col_rename)
-            # Only keep join columns in negated relation (robust to extra columns)
-            full_tbl_renamed = full_tbl_renamed[join_right_cols] if join_right_cols else full_tbl_renamed
-            # Anti-join: filter out rows that appear in the negated relation
+                        logger.debug(f"[NEG][JOIN] Skipping variable {term}: not in result columns, synthetic column, or position out of range")
+            
+            # If no shared variables, there's nothing to filter on
+            if not shared_vars:
+                logger.warning(f"[NEG][WARN] No shared variables between result and negated literal {lit}")
+                if full_tbl.num_rows() > 0:
+                    # This is a ground fact - if present, it negates everything
+                    logger.debug(f"[NEG][WARN] Negated relation has rows but no join keys. Result will be empty.")
+                    return result.from_records([])  # Return empty frame
+                continue
+            
+            logger.debug(f"[NEG][JOIN] Anti-join on: left cols={join_cols_left}, right cols={join_cols_right}")
+            logger.debug(f"[NEG][JOIN] Left (result) sample: {result.to_records()[:3]}")
+            logger.debug(f"[NEG][JOIN] Right (negated) sample: {full_tbl.to_records()[:3]}")
+            
+            # Perform anti-join: left outer join with indicator and keep rows marked as 'left_only'
             merged = result.merge(
-                full_tbl_renamed,
+                full_tbl,
                 how="left",
-                left_on=join_left_cols,
-                right_on=join_right_cols,
+                left_on=join_cols_left,
+                right_on=join_cols_right,
                 indicator=True
             )
-            filtered = merged.filter_equals("_merge", "left_only").drop(columns=["_merge"])
-            logger.debug(f"[NEG][FILTER] After filtering negated literal {lit}: columns={filtered.columns()}, sample={filtered.to_records()[:5]}")
-            result = filtered[orig_columns] if all(col in filtered.columns() for col in orig_columns) else filtered
+            
+            # Keep only rows where there was no match in the negated relation
+            filtered = merged.filter_equals("_merge", "left_only")
+            logger.debug(f"[NEG][JOIN] Filtered rows: {filtered.num_rows()} out of original {result.num_rows()}")
+            
+            # Keep only the original columns from our result table to clean up the result
+            result_cols = [col for col in orig_columns if col in filtered.columns()]
+            if filtered.num_rows() > 0 and result_cols:
+                result = filtered[result_cols]
+                logger.debug(f"[NEG][JOIN] After projection: {result.num_rows()} rows, columns={result.columns()}")
+                logger.debug(f"[NEG][JOIN] Sample after negation: {result.to_records()[:3]}")
+            else:
+                # If filtering resulted in empty result, return empty frame
+                logger.debug(f"[NEG][JOIN] No results after negation filtering")
+                result = filtered.from_records([])  # Empty frame with same columns
+                
         return result
 
 
@@ -621,38 +690,178 @@ class BottomUpEvaluator:
         logger.debug(f"[COMPARISON] Final result after all comparisons: {combined.num_rows()} rows")
         return combined
 
-    def _filter_aggregates(self, result, varmap, rule):
-        # No-op stub: just return as-is
+    def _filter_aggregates(self, result: Frame, varmap: dict, rule) -> tuple[Frame, dict]:
+        """
+        Apply aggregation operations to the result Frame, updating
+        varmap accordingly.
+        
+        Args:
+            result: Frame to aggregate
+            varmap: mapping of Variable -> column name
+            rule: the Rule being evaluated
+        
+        Returns:
+            Tuple of (aggregated_frame, updated_varmap)
+        """
+        
+        # Extract aggregation predicates from rule
+        aggregates = []
+        for lit in rule.body_literals:
+            if not lit.negated and lit.predicate in AGGREGATE_FUNCS:
+                aggregates.append(lit)
+        
+        if not aggregates:
+            return result, varmap
+            
+        # If we have aggregates but empty input, return empty frame with result structure
+        if result.num_rows() == 0:
+            # Create an empty frame with the expected structure
+            result_cols = list(varmap.values()) + [agg.terms[-1].name for agg in aggregates]
+            return make_frame.empty(result_cols), varmap
+            
+        # For each aggregate predicate, compute the aggregation
+        for agg_lit in aggregates:
+            logger.debug(f"[AGGREGATE] Processing aggregate: {agg_lit}")
+            agg_func = AGGREGATE_FUNCS[agg_lit.predicate]
+            
+            # Last arg is result variable, second-to-last is value variable
+            # All preceding args are grouping variables
+            result_var = agg_lit.terms[-1]
+            value_var = agg_lit.terms[-2]
+            group_vars = agg_lit.terms[:-2]
+            
+            logger.debug(f"[AGGREGATE] Result var: {result_var}, Value var: {value_var}, Group vars: {group_vars}")
+            
+            # Convert variables to column names using varmap
+            if value_var not in varmap:
+                logger.error(f"[AGGREGATE] Value variable {value_var} not in varmap {varmap}")
+                continue
+                
+            value_col = varmap[value_var]
+            group_cols = []
+            
+            for var in group_vars:
+                if var not in varmap:
+                    logger.error(f"[AGGREGATE] Group variable {var} not in varmap {varmap}")
+                    continue
+                group_cols.append(varmap[var])
+            
+            logger.debug(f"[AGGREGATE] Value column: {value_col}, Group columns: {group_cols}")
+            
+            # Group by group_cols and apply agg_func to value_col
+            logger.debug(f"[AGGREGATE] Input frame rows: {result.num_rows()}, columns: {result.columns()}")
+            
+            # Prepare result structures
+            agg_results = []
+            result_cols = list(group_cols)
+            result_cols.append(result_var.name)
+            
+            try:
+                # Get all rows as dictionaries
+                records = result.to_records()
+                
+                if group_cols:
+                    # Manual grouping by group_cols
+                    groups = {}
+                    for record in records:
+                        # Create a group key from group column values
+                        group_key = tuple(record[col] for col in group_cols)
+                        # Initialize group if not seen before
+                        if group_key not in groups:
+                            groups[group_key] = []
+                        # Add value to group
+                        groups[group_key].append(record[value_col])
+                    
+                    # Apply aggregation to each group
+                    for group_key, values in groups.items():
+                        row = {}
+                        # Add group columns to result
+                        for i, col in enumerate(group_cols):
+                            row[col] = group_key[i]
+                        # Add aggregated value
+                        row[result_var.name] = agg_func(values)
+                        agg_results.append(row)
+                else:
+                    # No grouping, aggregate all values
+                    values = [record[value_col] for record in records]
+                    agg_value = agg_func(values)
+                    agg_results.append({result_var.name: agg_value})
+            except Exception as e:
+                logger.error(f"[AGGREGATE] Error during aggregation: {e}")
+                return result, varmap
+                
+            # Create result frame and update varmap
+            logger.debug(f"[AGGREGATE] Creating result frame with columns {result_cols} from {agg_results}")
+            result = make_frame.from_dicts(agg_results, result_cols)
+            
+            # Create new varmap containing only group variables and result variable
+            new_varmap = {}
+            
+            # Add group variables to the new varmap with their column names in the result frame
+            for i, var in enumerate(group_vars):
+                new_varmap[var] = group_cols[i]
+            
+            # Add result variable to the new varmap
+            new_varmap[result_var] = result_var.name
+            
+            logger.debug(f"[AGGREGATE] Old varmap: {varmap}")
+            logger.debug(f"[AGGREGATE] New varmap: {new_varmap}")
+            
+            # Replace the varmap with the new one
+            varmap = new_varmap
+            
+            # Log which variables are available after aggregation
+            logger.debug(f"[AGGREGATE] Available variables after aggregation: {set(varmap.keys())}")
+            
+            # Store available variables in rule properties
+            rule.has_aggregates = True
+            rule.available_vars_after_agg = set(varmap.keys())
+            
+            logger.debug(f"[AGGREGATE] Updated rule properties: has_aggregates={rule.has_aggregates}, available_vars_after_agg={rule.available_vars_after_agg}")
+            
+            # Continue with next aggregate predicate
         return result, varmap
 
     def _evaluate_rule(self, rule, replace=False):
-        logger.debug(f"[EVAL][RULE][START] Evaluating rule: {rule}")
-        logger.debug(f"[EVAL][RULE][START][DEBUG] Head predicate: {repr(rule.head.predicate)} | Rule: {rule} | Body literals: {getattr(rule, 'body_literals', None) or getattr(rule, 'body', [])}")
+        '''Evaluate a single rule and return whether the head relation changed.'''
+        logger.debug(f"[EVAL][RULE] Evaluating rule: {rule.head.predicate} :- {[str(lit) for lit in getattr(rule, 'body_literals', [])]}")
+        
+        # Step 1: Find positive literals that aren't aggregates
+        positive_body_literals = []
+        agg_predicates = []
+        for lit in rule.body_literals:
+            if not lit.negated and lit.predicate not in AGGREGATE_FUNCS:
+                positive_body_literals.append(lit)
+            elif not lit.negated and lit.predicate in AGGREGATE_FUNCS:
+                agg_predicates.append(lit.predicate)
+                rule.has_aggregates = True
+        
+        # Step 2: Evaluate positive body without aggregates
+        result, varmap = self._evaluate_positive_body(positive_body_literals)
+        
+        # Early exit if empty result -- rule can't fire
+        if result.num_rows() == 0:  
+            logger.debug(f"[EVAL][RULE][EARLY EXIT] Empty positive body result")
+            return False
+            
         head_pred = rule.head.predicate
-        head_vars = [t for t in rule.head.terms if isinstance(t, Variable)]
-        body_literals = getattr(rule, 'body_literals', None)
-        if body_literals is None:
-            body_literals = getattr(rule, 'body', [])
-        comparisons = getattr(rule, 'comparisons', [])
-        positive_body_literals = [lit for lit in body_literals if not getattr(lit, 'negated', False)]
-        negated_literals = [lit for lit in body_literals if getattr(lit, 'negated', False)]
+        head_vars = rule.head.terms
+        
+        # 3. Identify any negative literals and comparison literals
+        negated_literals = [lit for lit in rule.body_literals if getattr(lit, 'negated', False)]
+        comparisons = rule.comparisons if hasattr(rule, 'comparisons') else []
+        
+        logger.debug(f"[EVAL][RULE][AFTER_POSBODY] Head: {head_pred}, Combined shape: {result.num_rows()}, Columns: {result.columns()}, Sample: {result.to_records()[:5]}")
 
-        logger.debug(f"[EVAL][RULE][BODY] Head: {head_pred}, Body literals: {positive_body_literals}, Negated: {negated_literals}, Comparisons: {comparisons}")
-
-        # 1. Evaluate positive body and get initial varmap
-        combined, varmap = self._evaluate_positive_body(positive_body_literals, comparisons=comparisons)
-
-        logger.debug(f"[EVAL][RULE][AFTER_POSBODY] Head: {head_pred}, Combined shape: {combined.num_rows()}, Columns: {combined.columns()}, Sample: {combined.to_records()[:5]}")
-
-        # 2. Ensure all needed variables are mapped and present as columns
-        full_varmap, combined = self._enforce_variable_column_mapping(
-            combined, varmap, head_vars, negated_literals, comparisons
+        # 4. Ensure all needed variables are mapped and present as columns
+        full_varmap, result = self._enforce_variable_column_mapping(
+            result, varmap, head_vars, negated_literals, comparisons
         )
 
         # 3. Apply all filters (negation, comparison, aggregate)
         logger.debug(f"[DIAG][RULE:{head_pred}] [PRE-FILTERS] comparisons: {comparisons}")
-        result, varmap = self._apply_all_filters(
-            combined, full_varmap, negated_literals, comparisons, rule
+        result, full_varmap = self._apply_all_filters(
+            result, full_varmap, negated_literals, comparisons, rule
         )
         logger.debug(f"[DIAG][RULE:{head_pred}] [POST-FILTERS] columns: {result.columns()}")
 
@@ -661,12 +870,12 @@ class BottomUpEvaluator:
         cols = result.columns()
         logger.debug(f"{pred_tag} [PRE-PROJECT] Columns: {cols}")
         logger.debug(f"{pred_tag} [PRE-PROJECT] Sample rows: {result.to_records()[:5]}")
-        logger.debug(f"{pred_tag} [PRE-PROJECT] varmap: {varmap}")
+        logger.debug(f"{pred_tag} [PRE-PROJECT] varmap: {full_varmap}")
         # Diagnostic: log projection mapping and DataFrame state for all predicates
-        logger.debug(f"{pred_tag} [PROJECT][START] varmap before projection: {varmap}")
+        logger.debug(f"{pred_tag} [PROJECT][START] varmap before projection: {full_varmap}")
         logger.debug(f"{pred_tag} [PROJECT][START] columns before projection: {cols}")
         logger.debug(f"[DIAG][PROJECTION][{head_pred}] head_vars: {head_vars}")
-        logger.debug(f"[DIAG][PROJECTION][{head_pred}] varmap: {varmap}")
+        logger.debug(f"[DIAG][PROJECTION][{head_pred}] varmap: {full_varmap}")
         logger.debug(f"[DIAG][PROJECTION][{head_pred}] result.columns: {cols}")
         logger.debug(f"[DIAG][PROJECTION][{head_pred}] result sample: {result.to_records()[:5]}")
         # PATCH: For base case (one body literal, all head vars distinct, all body terms are variables), set varmap by position
@@ -675,17 +884,18 @@ class BottomUpEvaluator:
             len(body_literals) == 1
             and len(head_vars) == len(set(head_vars))
             and len(head_vars) > 0  # Ensure head_vars is not empty
+            and not rule.has_aggregates  # Don't override varmap if we have aggregates
             and all(isinstance(t, type(head_vars[0])) for t in body_literals[0].terms)
             and all(isinstance(t, type(head_vars[0])) for t in head_vars)
         ):
             # Map head_vars[i] to result.columns()[i] by position
-            varmap = {hv: cols[i] for i, hv in enumerate(head_vars) if i < len(cols)}
-            logger.debug(f"[PATCH][PROJECTION][{head_pred}] Overriding varmap for base case: {varmap}")
+            full_varmap = {hv: cols[i] for i, hv in enumerate(head_vars) if i < len(cols)}
+            logger.debug(f"[PATCH][PROJECTION][{head_pred}] Overriding varmap for base case: {full_varmap}")
             logger.debug(f"[PATCH][PROJECTION][{head_pred}] DF before projection: columns={cols}, sample_rows={result.to_records()[:5]}")
             logger.debug(f"[PATCH][PROJECTION][{head_pred}] head_vars: {head_vars}")
-            logger.debug(f"[PATCH][PROJECTION][{head_pred}] varmap: {varmap}")
+            logger.debug(f"[PATCH][PROJECTION][{head_pred}] varmap: {full_varmap}")
         updated = self._enforce_head_schema_and_update(
-            result, varmap, rule, head_pred, head_vars, replace
+            result, full_varmap, rule, head_pred, head_vars, replace
         )
         full = self._full.get(head_pred, None)
 
@@ -696,80 +906,120 @@ class BottomUpEvaluator:
             logger.debug(f"{pred_tag} [FULL UPDATE] num_rows: {full.num_rows()}")
         return updated
 
-    def _enforce_variable_column_mapping(self, combined, varmap, head_vars, negated_literals, comparisons):
-        # Ensures all variables needed for the rule (head, negations, comparisons) are mapped to columns
+    def _enforce_variable_column_mapping(self, result, varmap, head_vars, negated_literals=None, comparisons=None):
+        """Ensure that all variables in head_vars and comparisons are mapped to columns.
+        This may require creating new columns with null values in some cases.
         
-        # 1. Collect all variables that need to be in the varmap
-        neg_vars = set()
-        for lit in negated_literals:
-            for t in lit.terms:
-                if isinstance(t, Variable):
-                    neg_vars.add(t)
+        Args:
+            result (Frame): The current partial result
+            varmap (dict): Current mapping of Variables to column names
+            head_vars (list): Variables in the head that need to be preserved
+            negated_literals (list, optional): Negated literals in the rule
+            comparisons (list, optional): Comparison literals in the rule
+            
+        Returns:
+            tuple: (updated_varmap, updated_result)
+        """
+        varmap = dict(varmap)  # Make a copy to avoid modifying the original
+        negated_literals = negated_literals or []
+        comparisons = comparisons or []
         
-        comp_vars = set()
+        # Log the original state for debugging
+        logger.debug(f"[VARMAP] Starting enforcement with varmap: {varmap}")
+        logger.debug(f"[VARMAP] Result columns: {result.columns()}")
+        logger.debug(f"[VARMAP] Head vars: {head_vars}")
+        
+        # Collect all variables that need to be in the result
+        all_needed_vars = set()        
+        
+        # Add head variables
+        for var in head_vars:
+            # Skip dummy variables or non-variable terms
+            if var.is_variable() and var.name != "__dummy__":
+                all_needed_vars.add(var)
+        
+        # Add variables from comparisons
         for comp in comparisons:
-            if hasattr(comp, 'left') and isinstance(comp.left, Variable):
-                comp_vars.add(comp.left)
-            if hasattr(comp, 'right') and isinstance(comp.right, Variable):
-                comp_vars.add(comp.right)
+            # For each term in the comparison that is a variable
+            for term in [comp.left, comp.right]:
+                if hasattr(term, 'is_variable') and term.is_variable():
+                    all_needed_vars.add(term)
+                    
+        # Add variables from negated literals that also appear in varmap
+        # (only the shared variables need to exist in both positive and negative literals)
+        for lit in negated_literals:
+            for term in lit.terms:
+                if hasattr(term, 'is_variable') and term.is_variable():
+                    for v in varmap:
+                        if term == v:
+                            all_needed_vars.add(term)
+                            break
         
-        all_needed_vars = set(head_vars) | neg_vars | comp_vars
-        cols = combined.columns()
+        logger.debug(f"[VARMAP] All needed vars: {all_needed_vars}")
         
-        logger.debug(f"[VARMAP][ENFORCE] Head vars: {head_vars}")
-        logger.debug(f"[VARMAP][ENFORCE] Negated vars: {neg_vars}")
-        logger.debug(f"[VARMAP][ENFORCE] Comparison vars: {comp_vars}")
-        logger.debug(f"[VARMAP][ENFORCE] All needed vars: {all_needed_vars}")
-        logger.debug(f"[VARMAP][ENFORCE] Initial varmap: {varmap}")
-        logger.debug(f"[VARMAP][ENFORCE] Available columns: {cols}")
+        # First make sure all columns in the result have a variable mapping
+        # This helps ensure we don't lose data when we map variables to columns
+        result_cols = result.columns()
+        for col in result_cols:
+            # If this column isn't mapped to any variable, create a mapping
+            if col != '__dummy__' and col not in varmap.values():
+                # For columns that seem to be actual variables and not synthetic ones
+                if not col.startswith('var_'):
+                    # Find a variable to map to this column or create one
+                    matching_var = None
+                    for var in all_needed_vars:
+                        if var.name == col and var not in varmap:
+                            matching_var = var
+                            break
+                    
+                    if not matching_var:
+                        # Create a new variable for this column
+                        # Variable is already imported at the top of the file
+                        matching_var = Variable(col)
+                        
+                    varmap[matching_var] = col
+                    logger.debug(f"[VARMAP] Mapped existing column {col} to variable {matching_var}")
         
-        # 2. Check each needed variable and ensure it has a mapping to a column
-        for v in all_needed_vars:
-            if v in varmap and varmap[v] in cols:
-                # Variable already has a valid mapping
-                logger.debug(f"[VARMAP][ENFORCE] Variable {v} already mapped to column {varmap[v]}")
-                continue
-            
-            # Try to find by name among existing mapped variables
-            mapped = False
-            for k in varmap:
-                if hasattr(k, 'name') and hasattr(v, 'name') and k.name == v.name and varmap[k] in cols:
-                    varmap[v] = varmap[k]
-                    logger.debug(f"[VARMAP][ENFORCE] Mapped variable {v} to column {varmap[v]} using existing mapping")
-                    mapped = True
-                    break
-            
-            if not mapped and hasattr(v, 'name'):
-                # Create a positional column name using a unique prefix
-                var_name = v.name
-                new_col_name = f"var_{var_name}_{len(varmap)}"
+        # Find variables that are not yet mapped to columns
+        unmapped_vars = set()
+        for var in all_needed_vars:
+            if var not in varmap or varmap[var] not in result.columns():
+                unmapped_vars.add(var)
                 
-                # Use the variable name as a fallback only if it already exists in the columns
-                if var_name in cols:
-                    varmap[v] = var_name
-                    logger.debug(f"[VARMAP][ENFORCE] Mapped variable {v} to existing column {var_name}")
-                else:
-                    # Add a new column with NULL values
-                    combined = combined.assign(**{new_col_name: [None] * combined.num_rows()})
-                    varmap[v] = new_col_name
-                    logger.debug(f"[VARMAP][ENFORCE] Created new column {new_col_name} for variable {v}")
-        
-        # 3. Verify that all needed variables now have mappings
-        unmapped_vars = [v for v in all_needed_vars if v not in varmap or varmap[v] not in cols]
         if unmapped_vars:
-            logger.warning(f"[VARMAP][ENFORCE] Could not map variables: {unmapped_vars}")
+            logger.debug(f"[VARMAP] Found {len(unmapped_vars)} unmapped variables: {unmapped_vars}")
+            
+            # Determine which unmapped vars are likely aggregate result variables 
+            # (those end with Sum, Count, Amount, etc.)
+            agg_result_vars = set()
+            for var in unmapped_vars:
+                var_name = var.name
+                if any(var_name.endswith(suffix) for suffix in ["Sum", "Count", "Avg", "Min", "Max", "Total", "Amount"]):
+                    agg_result_vars.add(var)
+                    logger.debug(f"[VARMAP] Detected aggregate result variable: {var}")
+                    
+            for var in unmapped_vars:
+                # Skip warning for special cases to reduce noise
+                if var.name == "__dummy__" or var in agg_result_vars:
+                    new_col_name = var.name
+                else:
+                    # For head variables that are not mapped, show a warning
+                    if var in head_vars:
+                        logger.warning(f"[VARMAP] Head variable {var} not mapped to any column. Creating new column.")
+                    else:
+                        logger.debug(f"[VARMAP] Variable {var} not mapped to any column. Creating new column.")
+                    new_col_name = f"{var.name}"
+                
+                # Add a new column with null/NA values
+                logger.debug(f"[VARMAP] Adding column {new_col_name} to result frame")
+                varmap[var] = new_col_name
+                # Use assign to add a new column (compatible with Frame interface)
+                result = result.assign(**{new_col_name: None})
         
-        # 4. Check for unused columns that might be used later
-        unused_cols = [c for c in cols if not any(c == varmap.get(v) for v in varmap)]
-        if unused_cols:
-            logger.debug(f"[VARMAP][ENFORCE] Unused columns: {unused_cols}")
+        logger.debug(f"[VARMAP] Final varmap: {varmap}")
+        logger.debug(f"[VARMAP] Final result columns: {result.columns()}")
         
-        logger.debug(f"[VARMAP][ENFORCE] Final varmap: {varmap}")
-        logger.debug(f"[VARMAP][ENFORCE] Final columns: {combined.columns()}")
-        
-        # Return a copy of the varmap to avoid modifying the original
-        full_varmap = dict(varmap)
-        return full_varmap, combined
+        return varmap, result
 
     def _apply_all_filters(self, combined, full_varmap, negated_literals, comparisons, rule):
         result = combined
@@ -779,8 +1029,9 @@ class BottomUpEvaluator:
         # --- Comparison filtering ---
         logger.debug(f"[DIAG][FILTERS] About to apply comparison filtering. comparisons: {comparisons}")
         result = self._filter_comparisons(result, full_varmap, comparisons or [])
-        # --- Aggregate filtering (stub) ---
-        # If you add aggregate logic, update varmap accordingly
+        # --- Aggregate filtering ---
+        # Apply aggregations and update varmap accordingly
+        result, full_varmap = self._filter_aggregates(result, full_varmap, rule)
         return result, full_varmap
 
     def _update_full_and_delta(self, result, head_pred, head_vars, varmap):
@@ -900,20 +1151,128 @@ class BottomUpEvaluator:
             logger.debug(f"[DELTA][{head_pred}] No new rows, delta is empty")
             return False
 
-    def _enforce_head_schema_and_update(self, result, varmap, rule, head_pred, head_vars, replace):
-        # result is always a Frame; enforce interface discipline
-        try:
-            # Get the internal column names to project for head variables
-            internal_cols = []
-            head_cols_map = {}
+    def _project_to_head(self, rule, result, varmap):
+        head_vars = rule.head.terms
+        logger.debug(f"[PROJECTION][{rule.head.predicate}] head_vars: {head_vars}")
+        logger.debug(f"[PROJECTION][{rule.head.predicate}] varmap: {varmap}")
+        logger.debug(f"[PROJECTION][{rule.head.predicate}] result.columns: {result.columns()}")
+        logger.debug(f"[PROJECTION][{rule.head.predicate}] result sample: {result.to_records()[:2] if result.num_rows() > 0 else []}")
+
+        if result.num_rows() == 0:
+            # Create an empty frame with the right structure
+            schema = [t.name for t in head_vars]
+            return make_frame.empty(schema)
             
+        # If we have processed aggregates, we need to filter the head vars to only those available
+        filtered_head_vars = head_vars
+        # Check if this rule has aggregates and filter head vars accordingly
+        if rule.has_aggregates:
+            available_vars = rule.available_vars_after_agg
+            if available_vars:
+                filtered_head_vars = [var for var in head_vars if var in available_vars]
+                logger.debug(f"[PROJECTION][{rule.head.predicate}] Filtered head_vars due to aggregation: {filtered_head_vars}")
+
+        logger.debug(f"[PROJECTION][{rule.head.predicate}] head_vars: {filtered_head_vars}")
+        logger.debug(f"[PROJECTION][{rule.head.predicate}] varmap: {varmap}")
+        logger.debug(f"[PROJECTION][{rule.head.predicate}] result.columns: {result.columns()}")
+        logger.debug(f"[PROJECTION][{rule.head.predicate}] result sample rows BEFORE projection: {result.to_records()[:2] if result.num_rows() > 0 else []}")
+
+        head_cols = []
+        head_var_names = []
+
+        for var in filtered_head_vars:
+            if var.is_variable():
+                if var in varmap:
+                    head_cols.append(varmap[var])
+                    head_var_names.append(var.name)
+                else:
+                    # Variable not found in varmap, use a dummy value
+                    result = result.assign(**{var.name: None})
+                    head_cols.append(var.name)
+                    head_var_names.append(var.name)
+
+        logger.debug(f"[PROJECTION][{rule.head.predicate}] head_cols (internal): {head_cols}")
+
+        # Select the relevant columns and rename to external names
+        projected = result.rename({src: dst for src, dst in zip(head_cols, head_var_names)})
+
+        logger.debug(f"[PROJECTION][{rule.head.predicate}] projected.columns after renaming: {projected.columns()}")
+        logger.debug(f"[PROJECTION][{rule.head.predicate}] projected sample rows: {projected.to_records()[:2] if projected.num_rows() > 0 else []}")
+
+        return projected
+        
+    def _enforce_head_schema_and_update(self, result, varmap, rule, head_pred, head_vars, replace):
+        """Project and rename columns in result to match head variable names, then update relations.
+        
+        Args:
+            result: Combined Frame with query results
+            varmap: Mapping from Variables to column names
+            rule: The Rule being evaluated
+            head_pred: Head predicate name
+            head_vars: List of Variable terms in head
+            replace: If True, overwrite existing relation; otherwise update incrementally
+            
+        Returns:
+            bool: True if relation was modified, False otherwise
+        """
+        try:
             logger.debug(f"[PROJECTION][{head_pred}] head_vars: {head_vars}")
             logger.debug(f"[PROJECTION][{head_pred}] varmap: {varmap}")
             logger.debug(f"[PROJECTION][{head_pred}] result.columns: {result.columns()}")
             logger.debug(f"[PROJECTION][{head_pred}] result sample rows BEFORE projection: {result.to_records()[:5]}")
             
-            # Get the internal column for each head variable from the varmap
+            # Special case for ground queries with "proved" variable
+            if len(head_vars) == 1 and head_vars[0].name == 'proved':
+                logger.debug(f"[PROJECTION][{head_pred}] Handling ground query result")
+                if result.num_rows() > 0:
+                    # Create a frame with a single row and "true" value
+                    projected = make_frame.from_dicts([{"proved": True}], ["proved"])
+                    logger.debug(f"[PROJECTION][{head_pred}] Ground query proved true, rows: {projected.num_rows()}, columns: {projected.columns()}")
+                else:
+                    # Empty result means the query is not proved
+                    projected = make_frame.empty(['proved'])
+                    logger.debug(f"[PROJECTION][{head_pred}] Ground query not proved, returning empty frame")
+                    
+                if replace:
+                    self._delta[head_pred] = projected.copy()
+                    self._full[head_pred] = projected.copy()
+                    return True
+                else:
+                    return self._update_full_and_delta(projected, head_pred, head_vars, varmap)
+            
+            # Special case for __dummy__ - we need to add meaningful columns instead
+            elif len(head_vars) == 1 and head_vars[0].name == '__dummy__':
+                if result.num_rows() > 0:
+                    # Get all the meaningful columns (excluding synthetic ones)
+                    cols = result.columns()
+                    relevant_cols = [c for c in cols if not c.startswith('var_')]
+                    
+                    # If the only meaningful column is __dummy__, just use it
+                    if not relevant_cols or (len(relevant_cols) == 1 and relevant_cols[0] == '__dummy__'):
+                        projected = result
+                    else:
+                        # Project to the meaningful columns
+                        projected = result[relevant_cols]
+                        
+                    logger.debug(f"[PROJECTION][{head_pred}] Special __dummy__ case, using columns: {projected.columns()}")
+                else:
+                    # Empty result with __dummy__ variable
+                    projected = make_frame.empty(['__dummy__'])
+                    
+                if replace:
+                    self._delta[head_pred] = projected.copy()
+                    self._full[head_pred] = projected.copy()
+                    return True
+                else:
+                    return self._update_full_and_delta(projected, head_pred, head_vars, varmap)
+            
+            # Normal case: map head variables to columns
+            internal_cols = []
+            head_cols_map = {}
+            user_cols = []
+            
             for v in head_vars:
+                user_cols.append(v.name)
                 if v in varmap and varmap[v] in result.columns():
                     internal_cols.append(varmap[v])
                     head_cols_map[varmap[v]] = v.name
@@ -922,18 +1281,17 @@ class BottomUpEvaluator:
                     logger.warning(f"[PROJECTION][{head_pred}] Could not find mapping for head variable {v} in varmap or column not in result")
             
             logger.debug(f"[PROJECTION][{head_pred}] head_cols (internal): {internal_cols}")
+            logger.debug(f"[PROJECTION][{head_pred}] user_cols: {user_cols}")
             
-            # Project only the internal columns needed for head variables
             if internal_cols:
-                # First project to the internal columns
+                # Project only to columns we need
                 projected = result[internal_cols]
                 
-                # Now rename the columns to the user variable names for output
+                # Rename columns to match user variable names
                 projected_renamed = projected.rename(head_cols_map)
                 logger.debug(f"[PROJECTION][{head_pred}] projected.columns after renaming: {projected_renamed.columns()}")
-                logger.debug(f"[PROJECTION][{head_pred}] projected sample rows: {projected_renamed.to_records()[:5]}")
+                logger.debug(f"[PROJECTION][{head_pred}] sample: {projected_renamed.to_records()[:5]}")
                 
-                # Success path: update relations with renamed columns
                 if replace:
                     self._delta[head_pred] = projected_renamed.copy()
                     self._full[head_pred] = projected_renamed.copy()
@@ -942,7 +1300,6 @@ class BottomUpEvaluator:
                     return self._update_full_and_delta(projected_renamed, head_pred, head_vars, varmap)
             else:
                 # No valid columns found, create empty frame with user variable names
-                user_cols = [v.name for v in head_vars]
                 empty_frame = make_frame.empty(user_cols)
                 
                 if replace:
@@ -951,15 +1308,32 @@ class BottomUpEvaluator:
                     return True
                 else:
                     return self._update_full_and_delta(empty_frame, head_pred, head_vars, varmap)
+                    
         except Exception as e:
             logger.warning(f"[PATCH][HEAD_SCHEMA] Could not enforce schema for '{head_pred}': {e}")
-            # Fall back to simple rename of internal columns to user variable names
-            rename_map = {varmap[v]: v.name for v in head_vars if v in varmap}
-            result_renamed = result.rename(rename_map)
             
-            if replace:
-                self._delta[head_pred] = result_renamed.copy()
-                self._full[head_pred] = result_renamed.copy()
-                return True
-            else:
-                return self._update_full_and_delta(result_renamed, head_pred, head_vars, varmap)
+            # Fallback: use a simple rename based on varmap
+            try:
+                rename_map = {}
+                for v in head_vars:
+                    if v in varmap:
+                        rename_map[varmap[v]] = v.name
+                
+                # If we can't remap columns, try to at least select the best columns from what's available
+                all_cols = result.columns()
+                if not rename_map and all_cols:
+                    cols_to_keep = [c for c in all_cols if not (c.startswith('var_') or c == '__dummy__')]
+                    if cols_to_keep:
+                        result = result[cols_to_keep]
+                    
+                result_renamed = result.rename(rename_map) if rename_map else result
+                
+                if replace:
+                    self._delta[head_pred] = result_renamed.copy()
+                    self._full[head_pred] = result_renamed.copy() 
+                    return True
+                else:
+                    return self._update_full_and_delta(result_renamed, head_pred, head_vars, varmap)
+            except Exception as e2:
+                logger.error(f"[PATCH][HEAD_SCHEMA] Even fallback failed for '{head_pred}': {e2}")
+                return False
