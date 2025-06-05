@@ -5,7 +5,8 @@ from typing import Dict, List, Set, Tuple, Union, Optional, Any
 from tqdm import tqdm
 
 from ..model.schema import RelationSchema
-from .frame import Frame, make_frame
+from .frame import Frame
+from .frame_factory import FrameFactory
 from ..model.rule import Rule
 from ..model.literal import Literal, Comparison
 from ..model.terms import Variable, Constant
@@ -57,10 +58,14 @@ class QueryResult:
     @classmethod
     def empty(cls, columns=None):
         """Create an empty result with the specified schema"""
+        # Get reference to the self._make_frame function from outer DatalogDatabase class
+        # This ensures we use the proper implementation even when used outside the database
+        make_frame_func = DatalogDatabase._make_frame if hasattr(DatalogDatabase, '_make_frame') else None
+        
         if columns:
-            frame = make_frame.from_dicts([], columns=columns)
+            frame = make_frame_func.from_dicts([], columns=columns) if make_frame_func else FrameFactory.from_dicts([], columns=columns)
         else:
-            frame = make_frame.from_dicts([], columns=[])
+            frame = make_frame_func.from_dicts([], columns=[]) if make_frame_func else FrameFactory.from_dicts([], columns=[])
         return cls(frame=frame, status="empty", message="No results found")
     
     @classmethod
@@ -75,8 +80,22 @@ class DatalogDatabase:
       - rules: List[Rule]
     Provides methods to declare relations, add facts/rules, query, etc.
     Also provides API methods to load Datalog from files/strings and query from strings.
+    
+    Each database instance can have its own Frame implementation type, independent
+    of other database instances or the global FrameFactory setting.
     """
     def __init__(self) -> None:
+        from .frame_factory import FrameFactory
+        
+        # Store the implementation name and class for this database instance
+        self._implementation_name = FrameFactory.get_current_implementation_name()
+        self._frame_class = FrameFactory.get_implementation()
+        
+        # Store a reference to the make_frame function for this implementation
+        # This ensures this database always uses its assigned implementation
+        # regardless of global FrameFactory state changes
+        self._make_frame = FrameFactory.get_make_frame_function()
+        
         self._relations: dict[str, tuple[RelationSchema, Frame]] = {}
         self.rules: list[Rule] = []
 
@@ -621,7 +640,7 @@ class DatalogDatabase:
             # Default column names: arg0, arg1, ..., arg{arity-1}
             colnames = tuple(f"arg{i}" for i in range(arity))
         schema = RelationSchema(predicate=predicate, arity=arity, colnames=colnames)
-        empty_frame = make_frame.empty(list(colnames))
+        empty_frame = self._make_frame.empty(list(colnames))
         self._relations[predicate] = (schema, empty_frame)
 
     def add_fact(self, atom: Literal) -> None:
@@ -649,7 +668,7 @@ class DatalogDatabase:
         # Always map fact values to schema columns by position, regardless of term names
         row = {schema.colnames[i]: atom.terms[i].value for i in range(arity)}
         logger.debug(f"[ADD_FACT][MAPPING] For predicate '{pred}', mapping fact values {[atom.terms[i].value for i in range(arity)]} to columns {schema.colnames}")
-        candidate = make_frame.from_dicts([row], list(schema.colnames))
+        candidate = self._make_frame.from_dicts([row], list(schema.colnames))
         logger.debug(f"[ADD_FACT] After insertion, columns for '{pred}': {frame.columns()}, sample row: {frame.to_records()[:1]}")
 
         if frame.num_rows() > 0:
@@ -739,7 +758,7 @@ class DatalogDatabase:
         pred = goal.predicate
         if pred not in self._relations:
             # No such relation: no results
-            return make_frame.empty([])
+            return self._make_frame.empty([])
 
         schema, frame = self._relations[pred]
         df = frame.copy()
@@ -765,7 +784,23 @@ class DatalogDatabase:
             {var_name: list(row.values())[i] for i, var_name in enumerate([v for _, v in var_positions])}
             for row in records
         ]
-        return make_frame.from_dicts(projected, [v for _, v in var_positions])
+        return self._make_frame.from_dicts(projected, [v for _, v in var_positions])
+
+    def evaluate(self, max_iterations: int = 1000) -> None:
+        """
+        Evaluate all rules in the database using a bottom-up approach.
+        This method executes the rules to derive all possible facts.
+        
+        Args:
+            max_iterations: Maximum number of iterations for the evaluation
+        """
+        # Import here to avoid circular import
+        from .evaluator import BottomUpEvaluator
+        
+        # Create evaluator and run the evaluation
+        evaluator = BottomUpEvaluator(self, max_iterations)
+        evaluator.evaluate(max_iterations)
+        evaluator.commit_to_db()
 
     def reset(self) -> None:
         """
@@ -773,6 +808,6 @@ class DatalogDatabase:
         Schemas remain declared.
         """
         for pred, (schema, _) in self._relations.items():
-            empty_frame = make_frame.empty(list(schema.colnames))
+            empty_frame = self._make_frame.empty(list(schema.colnames))
             self._relations[pred] = (schema, empty_frame)
         self.rules.clear()

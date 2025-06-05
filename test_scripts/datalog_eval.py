@@ -1,10 +1,13 @@
 import sys
 import os
 import pprint
+import argparse
 import logging
 from neuralkg.datalog.parser.datalog_parser import DatalogParser
 from neuralkg.datalog.engine.database import DatalogDatabase
-from neuralkg.datalog.engine.evaluator import BottomUpEvaluator
+from neuralkg.datalog.engine.frame_factory import FrameFactory
+from neuralkg.datalog.engine.frame_types import FrameImplementation
+from neuralkg.datalog.engine.config import config
 
 
 def print_table(results, header=None):
@@ -51,17 +54,83 @@ if not logger.hasHandlers():
 # If you want to globally suppress debug prints, set DLG_DEBUG=WARNING or ERROR
 
 def main():
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="Datalog Evaluation Script")
+    parser.add_argument(
+        "--config", 
+        type=str,
+        default="config/datalog.yaml",
+        help="Path to configuration file")
+    parser.add_argument(
+        "--implementation",
+        type=str,
+        choices=[impl.value for impl in FrameImplementation],
+        help=f"Override the Frame implementation to use. Available options: {FrameImplementation.get_all_implementations()}")
+    parser.add_argument(
+        "--datalog-file",
+        type=str,
+        default="test_data/dl1_test.datalog",
+        help="Path to Datalog program file")
+    
+    args = parser.parse_args()
+    
     print("[datalog_eval] Starting Datalog evaluation demo.")
-    db = DatalogDatabase()
+    
+    # Load configuration from file if specified
+    if os.path.exists(args.config):
+        print(f"Loading configuration from {args.config}")
+        FrameFactory.load_config_from_file(args.config)
+    else:
+        print(f"Configuration file {args.config} not found. Using default configuration.")
+    
+    # Determine which implementation to use
+    implementation_value = args.implementation  # May be None if not specified on command line
+    
+    if implementation_value:
+        # Validate that it's a valid enum value
+        try:
+            # Convert string to enum value
+            if FrameImplementation.is_valid(implementation_value):
+                implementation = FrameImplementation(implementation_value)
+            else:
+                valid_options = FrameImplementation.get_all_implementations()
+                raise ValueError(f"Invalid implementation: {implementation_value}. Valid options: {valid_options}")
+            print(f"Using specified Frame implementation: {implementation.value}")
+        except ValueError as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+    else:
+        # Otherwise use the one from configuration
+        FrameFactory.initialize()
+        impl_name = FrameFactory.get_current_implementation_name()
+        try:
+            # Validate the implementation from config
+            if FrameImplementation.is_valid(impl_name):
+                implementation = FrameImplementation(impl_name)
+            else:
+                # This should not happen if config validation is proper
+                valid_options = FrameImplementation.get_all_implementations()
+                raise ValueError(f"Invalid implementation in config: {impl_name}. Valid options: {valid_options}")
+            print(f"Using Frame implementation from config: {implementation.value}")
+        except ValueError as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+    
+    # Create the database with the specified implementation using the factory pattern
+    try:
+        db = FrameFactory.make_database(implementation)
+    except (ImportError, ValueError) as e:
+        print(f"Error creating database with {implementation.value} implementation: {e}")
+        sys.exit(1)
 
-    # Load a datalog file into the database
-    datalog_file = "test_data/dl1_test.datalog"
+    # Load the datalog file into the database
+    datalog_file = args.datalog_file
     print(f"Loading Datalog program from {datalog_file}")
     db.load_program_from_file(datalog_file)
     print("Loaded all facts and rules into DatalogDatabase.")
 
-    evaluator = BottomUpEvaluator(db)
-    evaluator.evaluate()
+    # Evaluate rules using the database's evaluate method
+    db.evaluate()
     print("Evaluation complete.")
 
     # DIAG: Print all rows for key relations

@@ -1,0 +1,33 @@
+# Default configuration for Datalog Engine
+frame:
+  # The default Frame implementation to use
+  implementation: pandas
+  
+  # Configuration for different Frame implementations
+  implementations:
+    # Pandas configuration (CPU-based)
+    pandas:
+      # No specific configuration needed for pandas
+    
+    # cuDF configuration (Single-GPU)
+    cudf:
+      # GPU device ID to use
+      device_id: 0
+      # Memory pool size for cuDF
+      memory_pool_size: "1GB"
+    
+    # Multi-node, multi-GPU configuration
+    mnmg:
+      # List of GPU device IDs to use
+      devices: [0]
+      # Partitioning strategy: hash, range, round_robin
+      partition_strategy: "hash"
+      # Communication backend: nccl, ucx
+      communication_backend: "nccl"
+    
+    # Scallop (probabilistic Datalog) configuration
+    scallop:
+      # Execution mode: exact, approximate, sampling
+      mode: "exact"
+      # Number of samples for sampling mode
+      samples: 1000
