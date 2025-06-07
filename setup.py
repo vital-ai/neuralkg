@@ -23,11 +23,13 @@ setup(
         'problog',
         'pysdd',
 
-        'klaycircuits>=0.0.2',
+        # 'klaycircuits>=0.0.2',
         'numpy',
 
         'scallopy',
-        'lark>=1.2.2'
+        'lark>=1.2.2',
+
+        'janus-swi>=1.5.2'
 
     ],
     extras_require={

@@ -4,7 +4,7 @@ from problog.sdd_formula import SDD
 import json
 from problog.formula import LogicFormula
 import torch
-from klay       import Circuit
+# from klay       import Circuit
 
 
 def main():
@@ -25,6 +25,8 @@ def main():
 
     # 4. Build KLay circuit by adding each root node
     roots = manager.vtree().get_sdd_rootnodes(manager)
+    
+    """
     circ = Circuit()
     for root in roots:
         circ.add_sdd(root)
@@ -52,6 +54,7 @@ def main():
     idx = query_strs.index(target)
     prob = outputs[idx].item()
     print(f"P({target}) = {prob:.6f}")
+    """
 
 if __name__ == '__main__':
     main()

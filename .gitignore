@@ -8,4 +8,5 @@ trained_model
 *.log
 config/datalog.yaml
 
+**/.DS_Store
 
