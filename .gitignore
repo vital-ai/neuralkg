@@ -10,3 +10,6 @@ config/datalog.yaml
 
 **/.DS_Store
 
+environment.yml
+
+.vscode

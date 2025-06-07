@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=64.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vital-neuralkg"
+version = "0.0.2"
+authors = [
+    {name = "Marc Hadfield", email = "marc@vital.ai"},
+]
+description = "Vital NeuralKG"
+readme = "README.md"
+license = {text = "Apache License 2.0"}
+requires-python = ">=3.12"
+classifiers = [
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "vital-ai-vitalsigns>=0.1.27",
+    "vital-ai-domain>=0.1.4",
+    "vital-ai-haley-kg>=0.1.24",
+    "kgraphservice>=0.0.6",
+    "pykeen",
+    "torch",
+    "problog",
+    "pysdd",
+    "numpy",
+    "scallopy",
+    "lark>=1.2.2",
+    "janus-swi>=1.5.2",
+]
+
+[project.urls]
+Homepage = "https://github.com/vital-ai/neuralkg"
